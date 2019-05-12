@@ -52,7 +52,7 @@ func (in *instrumentedService) RunPodSandbox(ctx context.Context, r *runtime.Run
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
-	logrus.Infof("RunPodSandbox with config %+v", r.GetConfig())
+	logrus.Infof("RunPodsandbox for %+v", r.GetConfig().GetMetadata())
 	defer func() {
 		if err != nil {
 			logrus.WithError(err).Errorf("RunPodSandbox for %+v failed, error", r.GetConfig().GetMetadata())
@@ -142,8 +142,8 @@ func (in *instrumentedService) CreateContainer(ctx context.Context, r *runtime.C
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
-	logrus.Infof("CreateContainer within sandbox %q with container config %+v and sandbox config %+v",
-		r.GetPodSandboxId(), r.GetConfig(), r.GetSandboxConfig())
+	logrus.Infof("CreateContainer within sandbox %q for container %+v",
+		r.GetPodSandboxId(), r.GetConfig().GetMetadata())
 	defer func() {
 		if err != nil {
 			logrus.WithError(err).Errorf("CreateContainer within sandbox %q for %+v failed",
@@ -299,7 +299,7 @@ func (in *instrumentedService) PullImage(ctx context.Context, r *runtime.PullIma
 	if err := in.checkInitialized(); err != nil {
 		return nil, err
 	}
-	logrus.Infof("PullImage %q with auth config %+v", r.GetImage().GetImage(), r.GetAuth())
+	logrus.Infof("PullImage %q", r.GetImage().GetImage())
 	defer func() {
 		if err != nil {
 			logrus.WithError(err).Errorf("PullImage %q failed", r.GetImage().GetImage())

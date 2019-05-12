@@ -30,16 +30,27 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/testutil"
-	"github.com/gotestyourself/gotestyourself/assert"
+	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/pkg/testutil"
 	digest "github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"gotest.tools/assert"
 )
 
+const (
+	emptyDigest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+)
+
+// StoreInitFn initializes content store with given root and returns a function for
+// destroying the content store
+type StoreInitFn func(ctx context.Context, root string) (context.Context, content.Store, func() error, error)
+
 // ContentSuite runs a test suite on the content store given a factory function.
-func ContentSuite(t *testing.T, name string, storeFn func(ctx context.Context, root string) (context.Context, content.Store, func() error, error)) {
+func ContentSuite(t *testing.T, name string, storeFn StoreInitFn) {
 	t.Run("Writer", makeTest(t, name, storeFn, checkContentStoreWriter))
 	t.Run("UpdateStatus", makeTest(t, name, storeFn, checkUpdateStatus))
+	t.Run("CommitExists", makeTest(t, name, storeFn, checkCommitExists))
 	t.Run("Resume", makeTest(t, name, storeFn, checkResumeWriter))
 	t.Run("ResumeTruncate", makeTest(t, name, storeFn, checkResume(resumeTruncate)))
 	t.Run("ResumeDiscard", makeTest(t, name, storeFn, checkResume(resumeDiscard)))
@@ -49,8 +60,18 @@ func ContentSuite(t *testing.T, name string, storeFn func(ctx context.Context, r
 	t.Run("SmallBlob", makeTest(t, name, storeFn, checkSmallBlob))
 	t.Run("Labels", makeTest(t, name, storeFn, checkLabels))
 
+	t.Run("CommitErrorState", makeTest(t, name, storeFn, checkCommitErrorState))
+}
+
+// ContentCrossNSSharedSuite runs a test suite under shared content policy
+func ContentCrossNSSharedSuite(t *testing.T, name string, storeFn StoreInitFn) {
 	t.Run("CrossNamespaceAppend", makeTest(t, name, storeFn, checkCrossNSAppend))
 	t.Run("CrossNamespaceShare", makeTest(t, name, storeFn, checkCrossNSShare))
+}
+
+// ContentCrossNSIsolatedSuite runs a test suite under isolated content policy
+func ContentCrossNSIsolatedSuite(t *testing.T, name string, storeFn StoreInitFn) {
+	t.Run("CrossNamespaceIsolate", makeTest(t, name, storeFn, checkCrossNSIsolate))
 }
 
 // ContextWrapper is used to decorate new context used inside the test
@@ -122,28 +143,28 @@ var labels = map[string]string{
 
 func checkContentStoreWriter(ctx context.Context, t *testing.T, cs content.Store) {
 	c1, d1 := createContent(256)
-	w1, err := cs.Writer(ctx, "c1", 0, "")
+	w1, err := cs.Writer(ctx, content.WithRef("c1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w1.Close()
 
 	c2, d2 := createContent(256)
-	w2, err := cs.Writer(ctx, "c2", int64(len(c2)), "")
+	w2, err := cs.Writer(ctx, content.WithRef("c2"), content.WithDescriptor(ocispec.Descriptor{Size: int64(len(c2))}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w2.Close()
 
 	c3, d3 := createContent(256)
-	w3, err := cs.Writer(ctx, "c3", 0, d3)
+	w3, err := cs.Writer(ctx, content.WithRef("c3"), content.WithDescriptor(ocispec.Descriptor{Digest: d3}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w3.Close()
 
 	c4, d4 := createContent(256)
-	w4, err := cs.Writer(ctx, "c4", int64(len(c4)), d4)
+	w4, err := cs.Writer(ctx, content.WithRef("c4"), content.WithDescriptor(ocispec.Descriptor{Size: int64(len(c4)), Digest: d4}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +247,7 @@ func checkResumeWriter(ctx context.Context, t *testing.T, cs content.Store) {
 	)
 
 	preStart := time.Now()
-	w1, err := cs.Writer(ctx, ref, 256, dgst)
+	w1, err := cs.Writer(ctx, content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{Size: 256, Digest: dgst}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +268,7 @@ func checkResumeWriter(ctx context.Context, t *testing.T, cs content.Store) {
 	checkStatus(t, w1, expected, dgstFirst, preStart, postStart, preUpdate, postUpdate)
 	assert.NilError(t, w1.Close(), "close first writer")
 
-	w2, err := cs.Writer(ctx, ref, 256, dgst)
+	w2, err := cs.Writer(ctx, content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{Size: 256, Digest: dgst}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,11 +301,212 @@ func checkResumeWriter(ctx context.Context, t *testing.T, cs content.Store) {
 	}
 }
 
+func checkCommitExists(ctx context.Context, t *testing.T, cs content.Store) {
+	c1, d1 := createContent(256)
+	if err := content.WriteBlob(ctx, cs, "c1", bytes.NewReader(c1), ocispec.Descriptor{Digest: d1}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, tc := range []struct {
+		expected digest.Digest
+	}{
+		{
+			expected: d1,
+		},
+		{},
+	} {
+		w, err := cs.Writer(ctx, content.WithRef(fmt.Sprintf("c1-commitexists-%d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(c1); err != nil {
+			w.Close()
+			t.Fatal(err)
+		}
+		err = w.Commit(ctx, int64(len(c1)), tc.expected)
+		w.Close()
+		if err == nil {
+			t.Errorf("(%d) Expected already exists error", i)
+		} else if !errdefs.IsAlreadyExists(err) {
+			t.Fatalf("(%d) Unexpected error: %+v", i, err)
+		}
+	}
+}
+
+func checkRefNotAvailable(ctx context.Context, t *testing.T, cs content.Store, ref string) {
+	t.Helper()
+
+	w, err := cs.Writer(ctx, content.WithRef(ref))
+	if err == nil {
+		w.Close()
+		t.Fatal("writer created with ref, expected to be in use")
+	}
+	if !errdefs.IsUnavailable(err) {
+		t.Fatalf("Expected unavailable error, got %+v", err)
+	}
+}
+
+func checkCommitErrorState(ctx context.Context, t *testing.T, cs content.Store) {
+	c1, d1 := createContent(256)
+	_, d2 := createContent(256)
+	if err := content.WriteBlob(ctx, cs, "c1", bytes.NewReader(c1), ocispec.Descriptor{Digest: d1}); err != nil {
+		t.Fatal(err)
+	}
+
+	ref := "c1-commiterror-state"
+	w, err := cs.Writer(ctx, content.WithRef(ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(c1); err != nil {
+		if err := w.Close(); err != nil {
+			t.Errorf("Close error: %+v", err)
+		}
+		t.Fatal(err)
+	}
+
+	checkRefNotAvailable(ctx, t, cs, ref)
+
+	// Check exists
+	err = w.Commit(ctx, int64(len(c1)), d1)
+	if err == nil {
+		t.Fatalf("Expected already exists error")
+	} else if !errdefs.IsAlreadyExists(err) {
+		if err := w.Close(); err != nil {
+			t.Errorf("Close error: %+v", err)
+		}
+		t.Fatalf("Unexpected error: %+v", err)
+	}
+
+	w, err = cs.Writer(ctx, content.WithRef(ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkRefNotAvailable(ctx, t, cs, ref)
+
+	if _, err := w.Write(c1); err != nil {
+		if err := w.Close(); err != nil {
+			t.Errorf("close error: %+v", err)
+		}
+		t.Fatal(err)
+	}
+
+	// Check exists without providing digest
+	err = w.Commit(ctx, int64(len(c1)), "")
+	if err == nil {
+		t.Fatalf("Expected already exists error")
+	} else if !errdefs.IsAlreadyExists(err) {
+		if err := w.Close(); err != nil {
+			t.Errorf("Close error: %+v", err)
+		}
+		t.Fatalf("Unexpected error: %+v", err)
+	}
+
+	w, err = cs.Writer(ctx, content.WithRef(ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkRefNotAvailable(ctx, t, cs, ref)
+
+	if _, err := w.Write(append(c1, []byte("more")...)); err != nil {
+		if err := w.Close(); err != nil {
+			t.Errorf("close error: %+v", err)
+		}
+		t.Fatal(err)
+	}
+
+	// Commit with the wrong digest should produce an error
+	err = w.Commit(ctx, int64(len(c1))+4, d2)
+	if err == nil {
+		t.Fatalf("Expected error from wrong digest")
+	} else if !errdefs.IsFailedPrecondition(err) {
+		t.Errorf("Unexpected error: %+v", err)
+	}
+
+	w, err = cs.Writer(ctx, content.WithRef(ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkRefNotAvailable(ctx, t, cs, ref)
+
+	// Commit with wrong size should also produce an error
+	err = w.Commit(ctx, int64(len(c1)), "")
+	if err == nil {
+		t.Fatalf("Expected error from wrong size")
+	} else if !errdefs.IsFailedPrecondition(err) {
+		t.Errorf("Unexpected error: %+v", err)
+	}
+
+	w, err = cs.Writer(ctx, content.WithRef(ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkRefNotAvailable(ctx, t, cs, ref)
+
+	// Now expect commit to succeed
+	if err := w.Commit(ctx, int64(len(c1))+4, ""); err != nil {
+		if err := w.Close(); err != nil {
+			t.Errorf("close error: %+v", err)
+		}
+		t.Fatalf("Failed to commit: %+v", err)
+	}
+
+	// Create another writer with same reference
+	w, err = cs.Writer(ctx, content.WithRef(ref))
+	if err != nil {
+		t.Fatalf("Failed to open writer: %+v", err)
+	}
+
+	if _, err := w.Write(c1); err != nil {
+		if err := w.Close(); err != nil {
+			t.Errorf("close error: %+v", err)
+		}
+		t.Fatal(err)
+	}
+
+	checkRefNotAvailable(ctx, t, cs, ref)
+
+	// Commit should fail due to already exists
+	err = w.Commit(ctx, int64(len(c1)), d1)
+	if err == nil {
+		t.Fatalf("Expected already exists error")
+	} else if !errdefs.IsAlreadyExists(err) {
+		if err := w.Close(); err != nil {
+			t.Errorf("close error: %+v", err)
+		}
+		t.Fatalf("Unexpected error: %+v", err)
+	}
+
+	w, err = cs.Writer(ctx, content.WithRef(ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkRefNotAvailable(ctx, t, cs, ref)
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close failed: %+v", err)
+	}
+
+	// Create another writer with same reference to check available
+	w, err = cs.Writer(ctx, content.WithRef(ref))
+	if err != nil {
+		t.Fatalf("Failed to open writer: %+v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close failed: %+v", err)
+	}
+}
+
 func checkUpdateStatus(ctx context.Context, t *testing.T, cs content.Store) {
 	c1, d1 := createContent(256)
 
 	preStart := time.Now()
-	w1, err := cs.Writer(ctx, "c1", 256, d1)
+	w1, err := cs.Writer(ctx, content.WithRef("c1"), content.WithDescriptor(ocispec.Descriptor{Size: 256, Digest: d1}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +574,7 @@ func checkUpdateStatus(ctx context.Context, t *testing.T, cs content.Store) {
 func checkLabels(ctx context.Context, t *testing.T, cs content.Store) {
 	c1, d1 := createContent(256)
 
-	w1, err := cs.Writer(ctx, "c1", 256, d1)
+	w1, err := cs.Writer(ctx, content.WithRef("c1-checklabels"), content.WithDescriptor(ocispec.Descriptor{Size: 256, Digest: d1}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,6 +588,7 @@ func checkLabels(ctx context.Context, t *testing.T, cs content.Store) {
 	labels := map[string]string{
 		"k1": "v1",
 		"k2": "v2",
+
 		"containerd.io/gc.root": rootTime,
 	}
 
@@ -402,6 +625,7 @@ func checkLabels(ctx context.Context, t *testing.T, cs content.Store) {
 
 	info.Labels = map[string]string{
 		"k1": "v1",
+
 		"containerd.io/gc.root": rootTime,
 	}
 	preUpdate = time.Now()
@@ -427,7 +651,7 @@ func checkResume(rf func(context.Context, content.Writer, []byte, int64, int64, 
 				limit := int64(float64(size) * tp)
 				ref := fmt.Sprintf("ref-%d-%d", i, j)
 
-				w, err := cs.Writer(ctx, ref, size, d)
+				w, err := cs.Writer(ctx, content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{Size: size, Digest: d}))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -441,7 +665,7 @@ func checkResume(rf func(context.Context, content.Writer, []byte, int64, int64, 
 					t.Fatal(err)
 				}
 
-				w, err = cs.Writer(ctx, ref, size, d)
+				w, err = cs.Writer(ctx, content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{Size: size, Digest: d}))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -530,7 +754,7 @@ func checkSmallBlob(ctx context.Context, t *testing.T, store content.Store) {
 	blobSize := int64(len(blob))
 	blobDigest := digest.FromBytes(blob)
 	// test write
-	w, err := store.Writer(ctx, t.Name(), blobSize, blobDigest)
+	w, err := store.Writer(ctx, content.WithRef(t.Name()), content.WithDescriptor(ocispec.Descriptor{Size: blobSize, Digest: blobDigest}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +769,7 @@ func checkSmallBlob(ctx context.Context, t *testing.T, store content.Store) {
 	}
 	// test read.
 	readSize := blobSize + 1
-	ra, err := store.ReaderAt(ctx, blobDigest)
+	ra, err := store.ReaderAt(ctx, ocispec.Descriptor{Digest: blobDigest})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,7 +799,7 @@ func checkCrossNSShare(ctx context.Context, t *testing.T, cs content.Store) {
 	ref := fmt.Sprintf("ref-%d", size)
 	t1 := time.Now()
 
-	if err := content.WriteBlob(ctx, cs, ref, bytes.NewReader(b), size, d); err != nil {
+	if err := content.WriteBlob(ctx, cs, ref, bytes.NewReader(b), ocispec.Descriptor{Size: size, Digest: d}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -585,7 +809,7 @@ func checkCrossNSShare(ctx context.Context, t *testing.T, cs content.Store) {
 	}
 	defer done(ctx2)
 
-	w, err := cs.Writer(ctx2, ref, size, d)
+	w, err := cs.Writer(ctx2, content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{Size: size, Digest: d}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,7 +850,7 @@ func checkCrossNSAppend(ctx context.Context, t *testing.T, cs content.Store) {
 	ref := fmt.Sprintf("ref-%d", size)
 	t1 := time.Now()
 
-	if err := content.WriteBlob(ctx, cs, ref, bytes.NewReader(b), size, d); err != nil {
+	if err := content.WriteBlob(ctx, cs, ref, bytes.NewReader(b), ocispec.Descriptor{Size: size, Digest: d}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -643,7 +867,7 @@ func checkCrossNSAppend(ctx context.Context, t *testing.T, cs content.Store) {
 	copy(b2[size:], extra)
 	d2 := digest.FromBytes(b2)
 
-	w, err := cs.Writer(ctx2, ref, size, d)
+	w, err := cs.Writer(ctx2, content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{Size: size, Digest: d}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,6 +904,38 @@ func checkCrossNSAppend(ctx context.Context, t *testing.T, cs content.Store) {
 		t.Fatal(err)
 	}
 
+}
+
+func checkCrossNSIsolate(ctx context.Context, t *testing.T, cs content.Store) {
+	wrap, ok := ctx.Value(wrapperKey{}).(ContextWrapper)
+	if !ok {
+		t.Skip("multiple contexts not supported")
+	}
+
+	var size int64 = 1000
+	b, d := createContent(size)
+	ref := fmt.Sprintf("ref-%d", size)
+	t1 := time.Now()
+
+	if err := content.WriteBlob(ctx, cs, ref, bytes.NewReader(b), ocispec.Descriptor{Size: size, Digest: d}); err != nil {
+		t.Fatal(err)
+	}
+	t2 := time.Now()
+
+	ctx2, done, err := wrap(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer done(ctx2)
+
+	t3 := time.Now()
+	w, err := cs.Writer(ctx2, content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{Size: size, Digest: d}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t4 := time.Now()
+
+	checkNewlyCreated(t, w, t1, t2, t3, t4)
 }
 
 func checkStatus(t *testing.T, w content.Writer, expected content.Status, d digest.Digest, preStart, postStart, preUpdate, postUpdate time.Time) {
@@ -726,6 +982,29 @@ func checkStatus(t *testing.T, w content.Writer, expected content.Status, d dige
 	}
 }
 
+func checkNewlyCreated(t *testing.T, w content.Writer, preStart, postStart, preUpdate, postUpdate time.Time) {
+	t.Helper()
+	st, err := w.Status()
+	if err != nil {
+		t.Fatalf("failed to get status: %v", err)
+	}
+
+	wd := w.Digest()
+	if wd != emptyDigest {
+		t.Fatalf("unexpected digest %v, expected %v", wd, emptyDigest)
+	}
+
+	if st.Offset != 0 {
+		t.Fatalf("unexpected offset %v", st.Offset)
+	}
+
+	if runtime.GOOS != "windows" {
+		if st.StartedAt.After(postUpdate) || st.StartedAt.Before(postStart) {
+			t.Fatalf("unexpected started at time %s, expected between %s and %s", st.StartedAt, postStart, postUpdate)
+		}
+	}
+}
+
 func checkInfo(ctx context.Context, cs content.Store, d digest.Digest, expected content.Info, c1, c2, u1, u2 time.Time) error {
 	info, err := cs.Info(ctx, d)
 	if err != nil {
@@ -768,7 +1047,7 @@ func checkContent(ctx context.Context, cs content.Store, d digest.Digest, expect
 		return err
 	}
 
-	b, err := content.ReadBlob(ctx, cs, d)
+	b, err := content.ReadBlob(ctx, cs, ocispec.Descriptor{Digest: d})
 	if err != nil {
 		return errors.Wrap(err, "failed to read blob")
 	}
@@ -789,7 +1068,7 @@ var contentSeed int64
 
 func createContent(size int64) ([]byte, digest.Digest) {
 	// each time we call this, we want to get a different seed, but it should
-	// be related to the intitialization order and fairly consistent between
+	// be related to the initialization order and fairly consistent between
 	// test runs. An atomic integer works just good enough for this.
 	seed := atomic.AddInt64(&contentSeed, 1)
 

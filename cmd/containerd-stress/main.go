@@ -29,9 +29,8 @@ import (
 	"time"
 
 	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/plugin"
 	metrics "github.com/docker/go-metrics"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
@@ -49,7 +48,7 @@ var (
 func init() {
 	ns := metrics.NewNamespace("stress", "", nil)
 	// if you want more fine grained metrics then you can drill down with the metrics in prom that
-	// containerd is outputing
+	// containerd is outputting
 	ct = ns.NewLabeledTimer("run", "Run time of a full container during the test", "commit")
 	execTimer = ns.NewLabeledTimer("exec", "Run time of an exec process during the test", "commit")
 	binarySizeGauge = ns.NewLabeledGauge("binary_size", "Binary size of compiled binaries", metrics.Bytes, "name")
@@ -145,6 +144,11 @@ func main() {
 			Name:  "metrics,m",
 			Usage: "address to serve the metrics API",
 		},
+		cli.StringFlag{
+			Name:  "runtime",
+			Usage: "set the runtime to stress test",
+			Value: plugin.RuntimeLinuxV1,
+		},
 	}
 	app.Before = func(context *cli.Context) error {
 		if context.GlobalBool("json") {
@@ -166,6 +170,7 @@ func main() {
 			Exec:        context.GlobalBool("exec"),
 			JSON:        context.GlobalBool("json"),
 			Metrics:     context.GlobalString("metrics"),
+			Runtime:     context.GlobalString("runtime"),
 		}
 		if config.Metrics != "" {
 			return serve(config)
@@ -185,10 +190,11 @@ type config struct {
 	Exec        bool
 	JSON        bool
 	Metrics     string
+	Runtime     string
 }
 
 func (c config) newClient() (*containerd.Client, error) {
-	return containerd.New(c.Address)
+	return containerd.New(c.Address, containerd.WithDefaultRuntime(c.Runtime))
 }
 
 func serve(c config) error {
@@ -220,7 +226,6 @@ func test(c config) error {
 	if err != nil {
 		return err
 	}
-	logrus.Info("generating spec from image")
 	tctx, cancel := context.WithTimeout(ctx, c.Duration)
 	go func() {
 		s := make(chan os.Signal, 1)
@@ -234,7 +239,6 @@ func test(c config) error {
 		r       = &run{}
 	)
 	logrus.Info("starting stress test run...")
-	args := oci.WithProcessArgs("true")
 	v, err := client.Version(ctx)
 	if err != nil {
 		return err
@@ -242,18 +246,9 @@ func test(c config) error {
 	// create the workers along with their spec
 	for i := 0; i < c.Concurrency; i++ {
 		wg.Add(1)
-		spec, err := oci.GenerateSpec(ctx, client,
-			&containers.Container{},
-			oci.WithImageConfig(image),
-			args,
-		)
-		if err != nil {
-			return err
-		}
 		w := &worker{
 			id:     i,
 			wg:     &wg,
-			spec:   spec,
 			image:  image,
 			client: client,
 			commit: v.Revision,
@@ -263,19 +258,10 @@ func test(c config) error {
 	var exec *execWorker
 	if c.Exec {
 		wg.Add(1)
-		spec, err := oci.GenerateSpec(ctx, client,
-			&containers.Container{},
-			oci.WithImageConfig(image),
-			args,
-		)
-		if err != nil {
-			return err
-		}
 		exec = &execWorker{
 			worker: worker{
 				id:     c.Concurrency,
 				wg:     &wg,
-				spec:   spec,
 				image:  image,
 				client: client,
 				commit: v.Revision,

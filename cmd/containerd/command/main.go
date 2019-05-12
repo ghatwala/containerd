@@ -20,16 +20,17 @@ import (
 	gocontext "context"
 	"fmt"
 	"io/ioutil"
-	golog "log"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/server"
+	"github.com/containerd/containerd/services/server"
+	srvconfig "github.com/containerd/containerd/services/server/config"
 	"github.com/containerd/containerd/sys"
 	"github.com/containerd/containerd/version"
 	"github.com/pkg/errors"
@@ -49,8 +50,13 @@ high performance container runtime
 `
 
 func init() {
+	logrus.SetFormatter(&logrus.TextFormatter{
+		TimestampFormat: log.RFC3339NanoFixed,
+		FullTimestamp:   true,
+	})
+
 	// Discard grpc logs so that they don't mess with our stdio
-	grpclog.SetLogger(golog.New(ioutil.Discard, "", golog.LstdFlags))
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, ioutil.Discard))
 
 	cli.VersionPrinter = func(c *cli.Context) {
 		fmt.Println(c.App.Name, version.Package, c.App.Version, version.Revision)
@@ -86,9 +92,11 @@ func App() *cli.App {
 			Usage: "containerd state directory",
 		},
 	}
+	app.Flags = append(app.Flags, serviceFlags()...)
 	app.Commands = []cli.Command{
 		configCommand,
 		publishCommand,
+		ociHook,
 	}
 	app.Action = func(context *cli.Context) error {
 		var (
@@ -99,27 +107,50 @@ func App() *cli.App {
 			config  = defaultConfig()
 		)
 
+		if err := srvconfig.LoadConfig(context.GlobalString("config"), config); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+
+		// Apply flags to the config
+		if err := applyFlags(context, config); err != nil {
+			return err
+		}
+
+		// Make sure top-level directories are created early.
+		if err := server.CreateTopLevelDirectories(config); err != nil {
+			return err
+		}
+
+		// Stop if we are registering or unregistering against Windows SCM.
+		stop, err := registerUnregisterService(config.Root)
+		if err != nil {
+			logrus.Fatal(err)
+		}
+		if stop {
+			return nil
+		}
+
 		done := handleSignals(ctx, signals, serverC)
 		// start the signal handler as soon as we can to make sure that
 		// we don't miss any signals during boot
 		signal.Notify(signals, handledSignals...)
 
-		if err := server.LoadConfig(context.GlobalString("config"), config); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		// apply flags to the config
-		if err := applyFlags(context, config); err != nil {
-			return err
-		}
 		// cleanup temp mounts
 		if err := mount.SetTempMountLocation(filepath.Join(config.Root, "tmpmounts")); err != nil {
 			return errors.Wrap(err, "creating temp mount location")
 		}
 		// unmount all temp mounts on boot for the server
-		if err := mount.CleanupTempMounts(0); err != nil {
-			return errors.Wrap(err, "unmounting temp mounts")
+		warnings, err := mount.CleanupTempMounts(0)
+		if err != nil {
+			log.G(ctx).WithError(err).Error("unmounting temp mounts")
 		}
-		address := config.GRPC.Address
+		for _, w := range warnings {
+			log.G(ctx).WithError(w).Warn("cleanup temp mount")
+		}
+		var (
+			address      = config.GRPC.Address
+			ttrpcAddress = fmt.Sprintf("%s.ttrpc", config.GRPC.Address)
+		)
 		if address == "" {
 			return errors.New("grpc address cannot be empty")
 		}
@@ -132,7 +163,14 @@ func App() *cli.App {
 		if err != nil {
 			return err
 		}
+
+		// Launch as a Windows Service if necessary
+		if err := launchService(server, done); err != nil {
+			logrus.Fatal(err)
+		}
+
 		serverC <- server
+
 		if config.Debug.Address != "" {
 			var l net.Listener
 			if filepath.IsAbs(config.Debug.Address) {
@@ -153,7 +191,21 @@ func App() *cli.App {
 			}
 			serve(ctx, l, server.ServeMetrics)
 		}
+		// setup the ttrpc endpoint
+		tl, err := sys.GetLocalListener(ttrpcAddress, config.GRPC.UID, config.GRPC.GID)
+		if err != nil {
+			return errors.Wrapf(err, "failed to get listener for main ttrpc endpoint")
+		}
+		serve(ctx, tl, server.ServeTTRPC)
 
+		if config.GRPC.TCPAddress != "" {
+			l, err := net.Listen("tcp", config.GRPC.TCPAddress)
+			if err != nil {
+				return errors.Wrapf(err, "failed to get listener for TCP grpc endpoint")
+			}
+			serve(ctx, l, server.ServeTCP)
+		}
+		// setup the main grpc endpoint
 		l, err := sys.GetLocalListener(address, config.GRPC.UID, config.GRPC.GID)
 		if err != nil {
 			return errors.Wrapf(err, "failed to get listener for main endpoint")
@@ -178,7 +230,7 @@ func serve(ctx gocontext.Context, l net.Listener, serveFunc func(net.Listener) e
 	}()
 }
 
-func applyFlags(context *cli.Context, config *server.Config) error {
+func applyFlags(context *cli.Context, config *srvconfig.Config) error {
 	// the order for config vs flag values is that flags will always override
 	// the config values if they are set
 	if err := setLevel(context, config); err != nil {
@@ -205,10 +257,13 @@ func applyFlags(context *cli.Context, config *server.Config) error {
 			*v.d = s
 		}
 	}
+
+	applyPlatformFlags(context)
+
 	return nil
 }
 
-func setLevel(context *cli.Context, config *server.Config) error {
+func setLevel(context *cli.Context, config *srvconfig.Config) error {
 	l := context.GlobalString("log-level")
 	if l == "" {
 		l = config.Debug.Level
@@ -221,4 +276,31 @@ func setLevel(context *cli.Context, config *server.Config) error {
 		logrus.SetLevel(lvl)
 	}
 	return nil
+}
+
+func dumpStacks(writeToFile bool) {
+	var (
+		buf       []byte
+		stackSize int
+	)
+	bufferLen := 16384
+	for stackSize == len(buf) {
+		buf = make([]byte, bufferLen)
+		stackSize = runtime.Stack(buf, true)
+		bufferLen *= 2
+	}
+	buf = buf[:stackSize]
+	logrus.Infof("=== BEGIN goroutine stack dump ===\n%s\n=== END goroutine stack dump ===", buf)
+
+	if writeToFile {
+		// Also write to file to aid gathering diagnostics
+		name := filepath.Join(os.TempDir(), fmt.Sprintf("containerd.%d.stacks.log", os.Getpid()))
+		f, err := os.Create(name)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		f.WriteString(string(buf))
+		logrus.Infof("goroutine stack dump written to %s", name)
+	}
 }

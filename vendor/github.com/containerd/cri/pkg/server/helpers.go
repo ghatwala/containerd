@@ -17,34 +17,31 @@ limitations under the License.
 package server
 
 import (
-	"encoding/json"
 	"fmt"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/containerd/containerd"
+	"github.com/BurntSushi/toml"
 	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/linux/runctypes"
+	"github.com/containerd/containerd/runtime/linux/runctypes"
+	runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/typeurl"
 	"github.com/docker/distribution/reference"
 	imagedigest "github.com/opencontainers/go-digest"
-	"github.com/opencontainers/image-spec/identity"
-	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
-	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/opencontainers/runtime-tools/generate"
-	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 
+	runtimeoptions "github.com/containerd/cri/pkg/api/runtimeoptions/v1"
 	criconfig "github.com/containerd/cri/pkg/config"
 	"github.com/containerd/cri/pkg/store"
+	containerstore "github.com/containerd/cri/pkg/store/container"
 	imagestore "github.com/containerd/cri/pkg/store/image"
-	"github.com/containerd/cri/pkg/util"
+	sandboxstore "github.com/containerd/cri/pkg/store/sandbox"
 )
 
 const (
@@ -64,8 +61,6 @@ const (
 const (
 	// defaultSandboxOOMAdj is default omm adj for sandbox container. (kubernetes#47938).
 	defaultSandboxOOMAdj = -998
-	// defaultSandboxCPUshares is default cpu shares for sandbox container.
-	defaultSandboxCPUshares = 2
 	// defaultShmSize is the default size of the sandbox shm.
 	defaultShmSize = int64(1024 * 1024 * 64)
 	// relativeRootfsPath is the rootfs path relative to bundle path.
@@ -81,20 +76,16 @@ const (
 	maxDNSSearches = 6
 	// Delimiter used to construct container/sandbox names.
 	nameDelimiter = "_"
-	// netNSFormat is the format of network namespace of a process.
-	netNSFormat = "/proc/%v/ns/net"
-	// ipcNSFormat is the format of ipc namespace of a process.
-	ipcNSFormat = "/proc/%v/ns/ipc"
-	// utsNSFormat is the format of uts namespace of a process.
-	utsNSFormat = "/proc/%v/ns/uts"
-	// pidNSFormat is the format of pid namespace of a process.
-	pidNSFormat = "/proc/%v/ns/pid"
 	// devShm is the default path of /dev/shm.
 	devShm = "/dev/shm"
 	// etcHosts is the default path of /etc/hosts file.
 	etcHosts = "/etc/hosts"
+	// etcHostname is the default path of /etc/hostname file.
+	etcHostname = "/etc/hostname"
 	// resolvConfPath is the abs path of resolv.conf on host or container.
 	resolvConfPath = "/etc/resolv.conf"
+	// hostnameEnv is the key for HOSTNAME env.
+	hostnameEnv = "HOSTNAME"
 )
 
 const (
@@ -106,6 +97,10 @@ const (
 	containerKindSandbox = "sandbox"
 	// containerKindContainer is a label value indicating container is application container
 	containerKindContainer = "container"
+	// imageLabelKey is the label key indicating the image is managed by cri plugin.
+	imageLabelKey = criContainerdPrefix + ".image"
+	// imageLabelValue is the label value indicating the image is managed by cri plugin.
+	imageLabelValue = "managed"
 	// sandboxMetadataExtension is an extension name that identify metadata of sandbox in CreateContainerRequest
 	sandboxMetadataExtension = criContainerdPrefix + ".sandbox.metadata"
 	// containerMetadataExtension is an extension name that identify metadata of container in CreateContainerRequest
@@ -120,13 +115,23 @@ const (
 	networkAttachCount = 2
 )
 
+// Runtime type strings for various runtimes.
+const (
+	// linuxRuntime is the legacy linux runtime for shim v1.
+	linuxRuntime = "io.containerd.runtime.v1.linux"
+	// runcRuntimeV1 is the runc v1 runtime for shim v2.
+	runcRuntimeV1 = "io.containerd.runc.v1"
+	// runcRuntimeV2 is the runc v2 runtime for shim v2.
+	runcRuntimeV2 = "io.containerd.runc.v2"
+)
+
 // makeSandboxName generates sandbox name from sandbox metadata. The name
 // generated is unique as long as sandbox metadata is unique.
 func makeSandboxName(s *runtime.PodSandboxMetadata) string {
 	return strings.Join([]string{
-		s.Name,      // 0
-		s.Namespace, // 1
-		s.Uid,       // 2
+		s.Name,                       // 0
+		s.Namespace,                  // 1
+		s.Uid,                        // 2
 		fmt.Sprintf("%d", s.Attempt), // 3
 	}, nameDelimiter)
 }
@@ -136,10 +141,10 @@ func makeSandboxName(s *runtime.PodSandboxMetadata) string {
 // unique.
 func makeContainerName(c *runtime.ContainerMetadata, s *runtime.PodSandboxMetadata) string {
 	return strings.Join([]string{
-		c.Name,      // 0
-		s.Name,      // 1: pod name
-		s.Namespace, // 2: pod namespace
-		s.Uid,       // 3: pod uid
+		c.Name,                       // 0
+		s.Name,                       // 1: pod name
+		s.Namespace,                  // 2: pod namespace
+		s.Uid,                        // 3: pod uid
 		fmt.Sprintf("%d", c.Attempt), // 4
 	}, nameDelimiter)
 }
@@ -179,6 +184,11 @@ func (c *criService) getVolatileContainerRootDir(id string) string {
 	return filepath.Join(c.config.StateDir, containersDir, id)
 }
 
+// getSandboxHostname returns the hostname file path inside the sandbox root directory.
+func (c *criService) getSandboxHostname(id string) string {
+	return filepath.Join(c.getSandboxRootDir(id), "hostname")
+}
+
 // getSandboxHosts returns the hosts file path inside the sandbox root directory.
 func (c *criService) getSandboxHosts(id string) string {
 	return filepath.Join(c.getSandboxRootDir(id), "hosts")
@@ -192,26 +202,6 @@ func (c *criService) getResolvPath(id string) string {
 // getSandboxDevShm returns the shm file path inside the sandbox root directory.
 func (c *criService) getSandboxDevShm(id string) string {
 	return filepath.Join(c.getVolatileSandboxRootDir(id), "shm")
-}
-
-// getNetworkNamespace returns the network namespace of a process.
-func getNetworkNamespace(pid uint32) string {
-	return fmt.Sprintf(netNSFormat, pid)
-}
-
-// getIPCNamespace returns the ipc namespace of a process.
-func getIPCNamespace(pid uint32) string {
-	return fmt.Sprintf(ipcNSFormat, pid)
-}
-
-// getUTSNamespace returns the uts namespace of a process.
-func getUTSNamespace(pid uint32) string {
-	return fmt.Sprintf(utsNSFormat, pid)
-}
-
-// getPIDNamespace returns the pid namespace of a process.
-func getPIDNamespace(pid uint32) string {
-	return fmt.Sprintf(pidNSFormat, pid)
 }
 
 // criContainerStateToString formats CRI container state to string.
@@ -234,28 +224,25 @@ func getRepoDigestAndTag(namedRef reference.Named, digest imagedigest.Digest, sc
 	return repoDigest, repoTag
 }
 
-// localResolve resolves image reference locally and returns corresponding image metadata. It returns
-// nil without error if the reference doesn't exist.
-func (c *criService) localResolve(ctx context.Context, refOrID string) (*imagestore.Image, error) {
+// localResolve resolves image reference locally and returns corresponding image metadata. It
+// returns store.ErrNotExist if the reference doesn't exist.
+func (c *criService) localResolve(refOrID string) (imagestore.Image, error) {
 	getImageID := func(refOrId string) string {
 		if _, err := imagedigest.Parse(refOrID); err == nil {
 			return refOrID
 		}
 		return func(ref string) string {
 			// ref is not image id, try to resolve it locally.
-			normalized, err := util.NormalizeImageRef(ref)
+			// TODO(random-liu): Handle this error better for debugging.
+			normalized, err := reference.ParseDockerRef(ref)
 			if err != nil {
 				return ""
 			}
-			image, err := c.client.GetImage(ctx, normalized.String())
+			id, err := c.imageStore.Resolve(normalized.String())
 			if err != nil {
 				return ""
 			}
-			desc, err := image.Config(ctx)
-			if err != nil {
-				return ""
-			}
-			return desc.Digest.String()
+			return id
 		}(refOrID)
 	}
 
@@ -264,14 +251,7 @@ func (c *criService) localResolve(ctx context.Context, refOrID string) (*imagest
 		// Try to treat ref as imageID
 		imageID = refOrID
 	}
-	image, err := c.imageStore.Get(imageID)
-	if err != nil {
-		if err == store.ErrNotExist {
-			return nil, nil
-		}
-		return nil, errors.Wrapf(err, "failed to get image %q", imageID)
-	}
-	return &image, nil
+	return c.imageStore.Get(imageID)
 }
 
 // getUserFromImage gets uid or user name of the image user.
@@ -296,12 +276,12 @@ func getUserFromImage(user string) (*int64, string) {
 // ensureImageExists returns corresponding metadata of the image reference, if image is not
 // pulled yet, the function will pull the image.
 func (c *criService) ensureImageExists(ctx context.Context, ref string) (*imagestore.Image, error) {
-	image, err := c.localResolve(ctx, ref)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to resolve image %q", ref)
+	image, err := c.localResolve(ref)
+	if err != nil && err != store.ErrNotExist {
+		return nil, errors.Wrapf(err, "failed to get image %q", ref)
 	}
-	if image != nil {
-		return image, nil
+	if err == nil {
+		return &image, nil
 	}
 	// Pull image to ensure the image exists
 	resp, err := c.PullImage(ctx, &runtime.PullImageRequest{Image: &runtime.ImageSpec{Image: ref}})
@@ -312,54 +292,9 @@ func (c *criService) ensureImageExists(ctx context.Context, ref string) (*images
 	newImage, err := c.imageStore.Get(imageID)
 	if err != nil {
 		// It's still possible that someone removed the image right after it is pulled.
-		return nil, errors.Wrapf(err, "failed to get image %q metadata after pulling", imageID)
+		return nil, errors.Wrapf(err, "failed to get image %q after pulling", imageID)
 	}
 	return &newImage, nil
-}
-
-// imageInfo is the information about the image got from containerd.
-type imageInfo struct {
-	id        string
-	chainID   imagedigest.Digest
-	size      int64
-	imagespec imagespec.Image
-}
-
-// getImageInfo gets image info from containerd.
-func getImageInfo(ctx context.Context, image containerd.Image) (*imageInfo, error) {
-	// Get image information.
-	diffIDs, err := image.RootFS(ctx)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get image diffIDs")
-	}
-	chainID := identity.ChainID(diffIDs)
-
-	size, err := image.Size(ctx)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get image compressed resource size")
-	}
-
-	desc, err := image.Config(ctx)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get image config descriptor")
-	}
-	id := desc.Digest.String()
-
-	rb, err := content.ReadBlob(ctx, image.ContentStore(), desc.Digest)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to read image config from content store")
-	}
-	var ociimage imagespec.Image
-	if err := json.Unmarshal(rb, &ociimage); err != nil {
-		return nil, errors.Wrapf(err, "failed to unmarshal image config %s", rb)
-	}
-
-	return &imageInfo{
-		id:        id,
-		chainID:   chainID,
-		size:      size,
-		imagespec: ociimage,
-	}, nil
 }
 
 func initSelinuxOpts(selinuxOpt *runtime.SELinuxOption) (string, string, error) {
@@ -370,9 +305,14 @@ func initSelinuxOpts(selinuxOpt *runtime.SELinuxOption) (string, string, error) 
 	// Should ignored selinuxOpts if they are incomplete.
 	if selinuxOpt.GetUser() == "" ||
 		selinuxOpt.GetRole() == "" ||
-		selinuxOpt.GetType() == "" ||
-		selinuxOpt.GetLevel() == "" {
+		selinuxOpt.GetType() == "" {
 		return "", "", nil
+	}
+
+	// make sure the format of "level" is correct.
+	ok, err := checkSelinuxLevel(selinuxOpt.GetLevel())
+	if err != nil || !ok {
+		return "", "", err
 	}
 
 	labelOpts := fmt.Sprintf("%s:%s:%s:%s",
@@ -380,13 +320,30 @@ func initSelinuxOpts(selinuxOpt *runtime.SELinuxOption) (string, string, error) 
 		selinuxOpt.GetRole(),
 		selinuxOpt.GetType(),
 		selinuxOpt.GetLevel())
-	return label.InitLabels(selinux.DupSecOpt(labelOpts))
+
+	options, err := label.DupSecOpt(labelOpts)
+	if err != nil {
+		return "", "", err
+	}
+	return label.InitLabels(options)
+}
+
+func checkSelinuxLevel(level string) (bool, error) {
+	if len(level) == 0 {
+		return true, nil
+	}
+
+	matched, err := regexp.MatchString(`^s\d(-s\d)??(:c\d{1,4}((.c\d{1,4})?,c\d{1,4})*(.c\d{1,4})?(,c\d{1,4}(.c\d{1,4})?)*)?$`, level)
+	if err != nil || !matched {
+		return false, errors.Wrapf(err, "the format of 'level' %q is not correct", level)
+	}
+	return true, nil
 }
 
 // isInCRIMounts checks whether a destination is in CRI mount list.
 func isInCRIMounts(dst string, mounts []*runtime.Mount) bool {
 	for _, m := range mounts {
-		if m.ContainerPath == dst {
+		if filepath.Clean(m.ContainerPath) == filepath.Clean(dst) {
 			return true
 		}
 	}
@@ -409,13 +366,6 @@ func buildLabels(configLabels map[string]string, containerType string) map[strin
 	return labels
 }
 
-// newSpecGenerator creates a new spec generator for the runtime spec.
-func newSpecGenerator(spec *runtimespec.Spec) generate.Generator {
-	g := generate.NewFromSpec(spec)
-	g.HostSpecific = true
-	return g
-}
-
 func getPodCNILabels(id string, config *runtime.PodSandboxConfig) map[string]string {
 	return map[string]string{
 		"K8S_POD_NAMESPACE":          config.GetMetadata().GetNamespace(),
@@ -425,22 +375,120 @@ func getPodCNILabels(id string, config *runtime.PodSandboxConfig) map[string]str
 	}
 }
 
-// getRuntimeConfigFromContainerInfo gets runtime configuration from containerd
-// container info.
-func getRuntimeConfigFromContainerInfo(c containers.Container) (criconfig.Runtime, error) {
-	r := criconfig.Runtime{
-		Type: c.Runtime.Name,
+// toRuntimeAuthConfig converts cri plugin auth config to runtime auth config.
+func toRuntimeAuthConfig(a criconfig.AuthConfig) *runtime.AuthConfig {
+	return &runtime.AuthConfig{
+		Username:      a.Username,
+		Password:      a.Password,
+		Auth:          a.Auth,
+		IdentityToken: a.IdentityToken,
 	}
+}
+
+// parseImageReferences parses a list of arbitrary image references and returns
+// the repotags and repodigests
+func parseImageReferences(refs []string) ([]string, []string) {
+	var tags, digests []string
+	for _, ref := range refs {
+		parsed, err := reference.ParseAnyReference(ref)
+		if err != nil {
+			continue
+		}
+		if _, ok := parsed.(reference.Canonical); ok {
+			digests = append(digests, parsed.String())
+		} else if _, ok := parsed.(reference.Tagged); ok {
+			tags = append(tags, parsed.String())
+		}
+	}
+	return tags, digests
+}
+
+// generateRuntimeOptions generates runtime options from cri plugin config.
+func generateRuntimeOptions(r criconfig.Runtime, c criconfig.Config) (interface{}, error) {
+	if r.Options == nil {
+		if r.Type != linuxRuntime {
+			return nil, nil
+		}
+		// This is a legacy config, generate runctypes.RuncOptions.
+		return &runctypes.RuncOptions{
+			Runtime:       r.Engine,
+			RuntimeRoot:   r.Root,
+			SystemdCgroup: c.SystemdCgroup,
+		}, nil
+	}
+	options := getRuntimeOptionsType(r.Type)
+	if err := toml.PrimitiveDecode(*r.Options, options); err != nil {
+		return nil, err
+	}
+	return options, nil
+}
+
+// getRuntimeOptionsType gets empty runtime options by the runtime type name.
+func getRuntimeOptionsType(t string) interface{} {
+	switch t {
+	case runcRuntimeV1:
+		fallthrough
+	case runcRuntimeV2:
+		return &runcoptions.Options{}
+	case linuxRuntime:
+		return &runctypes.RuncOptions{}
+	default:
+		return &runtimeoptions.Options{}
+	}
+}
+
+// getRuntimeOptions get runtime options from container metadata.
+func getRuntimeOptions(c containers.Container) (interface{}, error) {
 	if c.Runtime.Options == nil {
-		// CRI plugin makes sure that runtime option is always set.
-		return criconfig.Runtime{}, errors.New("runtime options is nil")
+		return nil, nil
 	}
-	data, err := typeurl.UnmarshalAny(c.Runtime.Options)
+	opts, err := typeurl.UnmarshalAny(c.Runtime.Options)
 	if err != nil {
-		return criconfig.Runtime{}, errors.Wrap(err, "failed to unmarshal runtime options")
+		return nil, err
 	}
-	runtimeOpts := data.(*runctypes.RuncOptions)
-	r.Engine = runtimeOpts.Runtime
-	r.Root = runtimeOpts.RuntimeRoot
-	return r, nil
+	return opts, nil
+}
+
+const (
+	// unknownExitCode is the exit code when exit reason is unknown.
+	unknownExitCode = 255
+	// unknownExitReason is the exit reason when exit reason is unknown.
+	unknownExitReason = "Unknown"
+)
+
+// unknownContainerStatus returns the default container status when its status is unknown.
+func unknownContainerStatus() containerstore.Status {
+	return containerstore.Status{
+		CreatedAt:  0,
+		StartedAt:  0,
+		FinishedAt: 0,
+		ExitCode:   unknownExitCode,
+		Reason:     unknownExitReason,
+	}
+}
+
+// unknownSandboxStatus returns the default sandbox status when its status is unknown.
+func unknownSandboxStatus() sandboxstore.Status {
+	return sandboxstore.Status{
+		State: sandboxstore.StateUnknown,
+	}
+}
+
+// getPassthroughAnnotations filters requested pod annotations by comparing
+// against permitted annotations for the given runtime.
+func getPassthroughAnnotations(podAnnotations map[string]string,
+	runtimePodAnnotations []string) (passthroughAnnotations map[string]string) {
+	passthroughAnnotations = make(map[string]string)
+
+	for podAnnotationKey, podAnnotationValue := range podAnnotations {
+		for _, pattern := range runtimePodAnnotations {
+			// Use path.Match instead of filepath.Match here.
+			// filepath.Match treated `\\` as path separator
+			// on windows, which is not what we want.
+			if ok, _ := path.Match(pattern, podAnnotationKey); ok {
+				passthroughAnnotations[podAnnotationKey] = podAnnotationValue
+			}
+		}
+	}
+	return passthroughAnnotations
 }

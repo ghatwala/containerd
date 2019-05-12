@@ -17,17 +17,19 @@ limitations under the License.
 package cri
 
 import (
+	"context"
 	"flag"
 	"path/filepath"
+	"time"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/api/services/containers/v1"
 	"github.com/containerd/containerd/api/services/diff/v1"
 	"github.com/containerd/containerd/api/services/images/v1"
-	"github.com/containerd/containerd/api/services/leases/v1"
 	"github.com/containerd/containerd/api/services/namespaces/v1"
 	"github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/plugin"
@@ -36,6 +38,7 @@ import (
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"k8s.io/klog"
 
 	criconfig "github.com/containerd/cri/pkg/config"
 	"github.com/containerd/cri/pkg/constants"
@@ -71,6 +74,10 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 	}
 	log.G(ctx).Infof("Start cri plugin with config %+v", c)
 
+	if err := validateConfig(ctx, &c); err != nil {
+		return nil, errors.Wrap(err, "invalid config")
+	}
+
 	if err := setGLogLevel(); err != nil {
 		return nil, errors.Wrap(err, "failed to set glog level")
 	}
@@ -102,6 +109,45 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 		// TODO(random-liu): Whether and how we can stop containerd.
 	}()
 	return s, nil
+}
+
+// validateConfig validates the given configuration.
+func validateConfig(ctx context.Context, c *criconfig.Config) error {
+	if c.ContainerdConfig.Runtimes == nil {
+		c.ContainerdConfig.Runtimes = make(map[string]criconfig.Runtime)
+	}
+
+	// Validation for deprecated untrusted_workload_runtime.
+	if c.ContainerdConfig.UntrustedWorkloadRuntime.Type != "" {
+		log.G(ctx).Warning("`untrusted_workload_runtime` is deprecated, please use `untrusted` runtime in `runtimes` instead")
+		if _, ok := c.ContainerdConfig.Runtimes[criconfig.RuntimeUntrusted]; ok {
+			return errors.Errorf("conflicting definitions: configuration includes both `untrusted_workload_runtime` and `runtimes[%q]`", criconfig.RuntimeUntrusted)
+		}
+		c.ContainerdConfig.Runtimes[criconfig.RuntimeUntrusted] = c.ContainerdConfig.UntrustedWorkloadRuntime
+	}
+
+	// Validation for deprecated default_runtime field.
+	if c.ContainerdConfig.DefaultRuntime.Type != "" {
+		log.G(ctx).Warning("`default_runtime` is deprecated, please use `default_runtime_name` to reference the default configuration you have defined in `runtimes`")
+		c.ContainerdConfig.DefaultRuntimeName = criconfig.RuntimeDefault
+		c.ContainerdConfig.Runtimes[criconfig.RuntimeDefault] = c.ContainerdConfig.DefaultRuntime
+	}
+
+	// Validation for default_runtime_name
+	if c.ContainerdConfig.DefaultRuntimeName == "" {
+		return errors.New("`default_runtime_name` is empty")
+	}
+	if _, ok := c.ContainerdConfig.Runtimes[c.ContainerdConfig.DefaultRuntimeName]; !ok {
+		return errors.New("no corresponding runtime configured in `runtimes` for `default_runtime_name`")
+	}
+
+	// Validation for stream_idle_timeout
+	if c.StreamIdleTimeout != "" {
+		if _, err := time.ParseDuration(c.StreamIdleTimeout); err != nil {
+			return errors.Wrap(err, "invalid stream idle timeout")
+		}
+	}
+	return nil
 }
 
 // getServicesOpts get service options from plugin context.
@@ -137,7 +183,7 @@ func getServicesOpts(ic *plugin.InitContext) ([]containerd.ServicesOpt, error) {
 			return containerd.WithNamespaceService(s.(namespaces.NamespacesClient))
 		},
 		services.LeasesService: func(s interface{}) containerd.ServicesOpt {
-			return containerd.WithLeasesService(s.(leases.LeasesClient))
+			return containerd.WithLeasesService(s.(leases.Manager))
 		},
 	} {
 		p := plugins[s]
@@ -159,16 +205,18 @@ func getServicesOpts(ic *plugin.InitContext) ([]containerd.ServicesOpt, error) {
 // Set glog level.
 func setGLogLevel() error {
 	l := logrus.GetLevel()
-	if err := flag.Set("logtostderr", "true"); err != nil {
+	fs := flag.NewFlagSet("klog", flag.PanicOnError)
+	klog.InitFlags(fs)
+	if err := fs.Set("logtostderr", "true"); err != nil {
 		return err
 	}
 	switch l {
 	case log.TraceLevel:
-		return flag.Set("v", "5")
+		return fs.Set("v", "5")
 	case logrus.DebugLevel:
-		return flag.Set("v", "4")
+		return fs.Set("v", "4")
 	case logrus.InfoLevel:
-		return flag.Set("v", "2")
+		return fs.Set("v", "2")
 	// glog doesn't support following filters. Defaults to v=0.
 	case logrus.WarnLevel:
 	case logrus.ErrorLevel:

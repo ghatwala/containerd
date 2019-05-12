@@ -20,12 +20,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	_ "crypto/sha256" // required for digest package
 	"fmt"
 	"io"
 	"io/ioutil"
-	mrand "math/rand"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -36,9 +35,12 @@ import (
 
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/content/testsuite"
-	"github.com/containerd/containerd/testutil"
-	"github.com/gotestyourself/gotestyourself/assert"
+	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/pkg/testutil"
+
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"gotest.tools/assert"
 )
 
 type memoryLabelStore struct {
@@ -108,7 +110,7 @@ func TestContentWriter(t *testing.T) {
 		t.Fatal("ingest dir should be created", err)
 	}
 
-	cw, err := cs.Writer(ctx, "myref", 0, "")
+	cw, err := cs.Writer(ctx, content.WithRef("myref"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,13 +119,13 @@ func TestContentWriter(t *testing.T) {
 	}
 
 	// reopen, so we can test things
-	cw, err = cs.Writer(ctx, "myref", 0, "")
+	cw, err = cs.Writer(ctx, content.WithRef("myref"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// make sure that second resume also fails
-	if _, err = cs.Writer(ctx, "myref", 0, ""); err == nil {
+	if _, err = cs.Writer(ctx, content.WithRef("myref")); err == nil {
 		// TODO(stevvooe): This also works across processes. Need to find a way
 		// to test that, as well.
 		t.Fatal("no error on second resume")
@@ -166,14 +168,16 @@ func TestContentWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cw, err = cs.Writer(ctx, "aref", 0, "")
+	cw, err = cs.Writer(ctx, content.WithRef("aref"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// now, attempt to write the same data again
 	checkCopy(t, int64(len(p)), cw, bufio.NewReader(ioutil.NopCloser(bytes.NewReader(p))))
-	if err := cw.Commit(ctx, int64(len(p)), expected); err != nil {
+	if err := cw.Commit(ctx, int64(len(p)), expected); err == nil {
+		t.Fatal("expected already exists error")
+	} else if !errdefs.IsAlreadyExists(err) {
 		t.Fatal(err)
 	}
 
@@ -265,9 +269,9 @@ func generateBlobs(t checker, nblobs, maxsize int64) map[digest.Digest][]byte {
 	blobs := map[digest.Digest][]byte{}
 
 	for i := int64(0); i < nblobs; i++ {
-		p := make([]byte, mrand.Int63n(maxsize))
+		p := make([]byte, rand.Int63n(maxsize))
 
-		if _, err := mrand.Read(p); err != nil {
+		if _, err := rand.Read(p); err != nil {
 			t.Fatal(err)
 		}
 
@@ -346,7 +350,8 @@ func checkBlobPath(t *testing.T, cs content.Store, dgst digest.Digest) string {
 }
 
 func checkWrite(ctx context.Context, t checker, cs content.Store, dgst digest.Digest, p []byte) digest.Digest {
-	if err := content.WriteBlob(ctx, cs, dgst.String(), bytes.NewReader(p), int64(len(p)), dgst); err != nil {
+	if err := content.WriteBlob(ctx, cs, dgst.String(), bytes.NewReader(p),
+		ocispec.Descriptor{Size: int64(len(p)), Digest: dgst}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -365,29 +370,50 @@ func TestWriterTruncateRecoversFromIncompleteWrite(t *testing.T) {
 	defer cancel()
 
 	ref := "ref"
-	content := []byte("this is the content")
-	total := int64(len(content))
+	contentB := []byte("this is the content")
+	total := int64(len(contentB))
 	setupIncompleteWrite(ctx, t, cs, ref, total)
 
-	writer, err := cs.Writer(ctx, ref, total, "")
+	writer, err := cs.Writer(ctx, content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{Size: total}))
 	assert.NilError(t, err)
 
 	assert.NilError(t, writer.Truncate(0))
 
-	_, err = writer.Write(content)
+	_, err = writer.Write(contentB)
 	assert.NilError(t, err)
 
-	dgst := digest.FromBytes(content)
+	dgst := digest.FromBytes(contentB)
 	err = writer.Commit(ctx, total, dgst)
 	assert.NilError(t, err)
 }
 
 func setupIncompleteWrite(ctx context.Context, t *testing.T, cs content.Store, ref string, total int64) {
-	writer, err := cs.Writer(ctx, ref, total, "")
+	writer, err := cs.Writer(ctx, content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{Size: total}))
 	assert.NilError(t, err)
 
 	_, err = writer.Write([]byte("bad data"))
 	assert.NilError(t, err)
 
 	assert.NilError(t, writer.Close())
+}
+
+func TestWriteReadEmptyFileTimestamp(t *testing.T) {
+	root, err := ioutil.TempDir("", "test-write-read-file-timestamp")
+	if err != nil {
+		t.Errorf("failed to create a tmp dir: %v", err)
+	}
+	defer os.RemoveAll(root)
+
+	emptyFile := filepath.Join(root, "updatedat")
+	if err := writeTimestampFile(emptyFile, time.Time{}); err != nil {
+		t.Errorf("failed to write Zero Time to file: %v", err)
+	}
+
+	timestamp, err := readFileTimestamp(emptyFile)
+	if err != nil {
+		t.Errorf("read empty timestamp file should success, but got error: %v", err)
+	}
+	if !timestamp.IsZero() {
+		t.Errorf("read empty timestamp file should return time.Time{}, but got: %v", timestamp)
+	}
 }

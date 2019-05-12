@@ -1,3 +1,19 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
 package aufs
 
 import (
@@ -50,7 +66,7 @@ type snapshotter struct {
 // New creates a new snapshotter using aufs
 func New(root string) (snapshots.Snapshotter, error) {
 	if err := supported(); err != nil {
-		return nil, err
+		return nil, errors.Wrap(plugin.ErrSkipPlugin, err.Error())
 	}
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
@@ -99,8 +115,7 @@ func (o *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 
 // Usage returns the resources taken by the snapshot identified by key.
 //
-// For active snapshots, this will scan the usage of the overlay "diff" (aka
-// "upper") directory and may take some time.
+// For active snapshots, this will scan the usage of directory and may take some time.
 //
 // For committed snapshots, the value is returned from the metadata database.
 func (o *snapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
@@ -117,7 +132,7 @@ func (o *snapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, e
 	t.Rollback() // transaction no longer needed at this point.
 
 	if info.Kind == snapshots.KindActive {
-		du, err := fs.DiskUsage(upperPath)
+		du, err := fs.DiskUsage(ctx, upperPath)
 		if err != nil {
 			// TODO(stevvooe): Consider not reporting an error in this case.
 			return snapshots.Usage{}, err
@@ -174,7 +189,7 @@ func (o *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		return err
 	}
 
-	usage, err := fs.DiskUsage(o.upperPath(id))
+	usage, err := fs.DiskUsage(ctx, o.upperPath(id))
 	if err != nil {
 		return err
 	}
@@ -318,8 +333,7 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 
 func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 	if len(s.ParentIDs) == 0 {
-		// if we only have one layer/no parents then just return a bind mount as overlay
-		// will not work
+		// if we only have one layer/no parents then just return a bind mount
 		roFlag := "rw"
 		if s.Kind == snapshots.KindView {
 			roFlag = "ro"

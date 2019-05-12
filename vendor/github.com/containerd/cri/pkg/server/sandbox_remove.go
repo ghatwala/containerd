@@ -46,14 +46,20 @@ func (c *criService) RemovePodSandbox(ctx context.Context, r *runtime.RemovePodS
 	// Use the full sandbox id.
 	id := sandbox.ID
 
-	// Return error if sandbox container is still running.
-	if sandbox.Status.Get().State == sandboxstore.StateReady {
+	// Return error if sandbox container is still running or unknown.
+	state := sandbox.Status.Get().State
+	if state == sandboxstore.StateReady || state == sandboxstore.StateUnknown {
 		return nil, errors.Errorf("sandbox container %q is not fully stopped", id)
 	}
 
 	// Return error if sandbox network namespace is not closed yet.
-	if sandbox.NetNS != nil && !sandbox.NetNS.Closed() {
-		return nil, errors.Errorf("sandbox network namespace %q is not fully closed", sandbox.NetNS.GetPath())
+	if sandbox.NetNS != nil {
+		nsPath := sandbox.NetNS.GetPath()
+		if closed, err := sandbox.NetNS.Closed(); err != nil {
+			return nil, errors.Wrapf(err, "failed to check sandbox network namespace %q closed", nsPath)
+		} else if !closed {
+			return nil, errors.Errorf("sandbox network namespace %q is not fully closed", nsPath)
+		}
 	}
 
 	// Remove all containers inside the sandbox.

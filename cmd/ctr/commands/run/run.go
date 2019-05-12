@@ -19,10 +19,7 @@ package run
 import (
 	gocontext "context"
 	"encoding/csv"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"runtime"
 	"strings"
 
 	"github.com/containerd/console"
@@ -37,74 +34,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
-
-// ContainerFlags are cli flags specifying container options
-var ContainerFlags = []cli.Flag{
-	cli.StringFlag{
-		Name:  "config,c",
-		Usage: "path to the runtime-specific spec config file",
-	},
-	cli.StringFlag{
-		Name:  "checkpoint",
-		Usage: "provide the checkpoint digest to restore the container",
-	},
-	cli.StringFlag{
-		Name:  "cwd",
-		Usage: "specify the working directory of the process",
-	},
-	cli.StringSliceFlag{
-		Name:  "env",
-		Usage: "specify additional container environment variables (i.e. FOO=bar)",
-	},
-	cli.StringSliceFlag{
-		Name:  "label",
-		Usage: "specify additional labels (i.e. foo=bar)",
-	},
-	cli.StringSliceFlag{
-		Name:  "mount",
-		Usage: "specify additional container mount (ex: type=bind,src=/tmp,dst=/host,options=rbind:ro)",
-	},
-	cli.BoolFlag{
-		Name:  "net-host",
-		Usage: "enable host networking for the container",
-	},
-	cli.BoolFlag{
-		Name:  "privileged",
-		Usage: "run privileged container",
-	},
-	cli.BoolFlag{
-		Name:  "read-only",
-		Usage: "set the containers filesystem as readonly",
-	},
-	cli.StringFlag{
-		Name:  "runtime",
-		Usage: "runtime name (io.containerd.runtime.v1.linux, io.containerd.runtime.v1.windows, io.containerd.runtime.v1.com.vmware.linux)",
-		Value: fmt.Sprintf("io.containerd.runtime.v1.%s", runtime.GOOS),
-	},
-	cli.BoolFlag{
-		Name:  "tty,t",
-		Usage: "allocate a TTY for the container",
-	},
-	cli.StringSliceFlag{
-		Name:  "with-ns",
-		Usage: "specify existing Linux namespaces to join at container runtime (format '<nstype>:<path>')",
-	},
-	cli.StringFlag{
-		Name:  "pid-file",
-		Usage: "file path to write the task's pid",
-	},
-}
-
-func loadSpec(path string, s *specs.Spec) error {
-	raw, err := ioutil.ReadFile(path)
-	if err != nil {
-		return errors.New("cannot load spec config file")
-	}
-	if err := json.Unmarshal(raw, s); err != nil {
-		return errors.Errorf("decoding spec config file failed, current supported OCI runtime-spec : v%s", specs.Version)
-	}
-	return nil
-}
 
 func withMounts(context *cli.Context) oci.SpecOpts {
 	return func(ctx gocontext.Context, client oci.Client, container *containers.Container, s *specs.Spec) error {
@@ -157,9 +86,10 @@ func parseMountFlag(m string) (specs.Mount, error) {
 
 // Command runs a container
 var Command = cli.Command{
-	Name:      "run",
-	Usage:     "run a container",
-	ArgsUsage: "[flags] Image|RootFS ID [COMMAND] [ARG...]",
+	Name:           "run",
+	Usage:          "run a container",
+	ArgsUsage:      "[flags] Image|RootFS ID [COMMAND] [ARG...]",
+	SkipArgReorder: true,
 	Flags: append([]cli.Flag{
 		cli.BoolFlag{
 			Name:  "rm",
@@ -169,6 +99,10 @@ var Command = cli.Command{
 			Name:  "null-io",
 			Usage: "send all IO to /dev/null",
 		},
+		cli.StringFlag{
+			Name:  "log-uri",
+			Usage: "log uri",
+		},
 		cli.BoolFlag{
 			Name:  "detach,d",
 			Usage: "detach from the task after it has started execution",
@@ -177,19 +111,34 @@ var Command = cli.Command{
 			Name:  "fifo-dir",
 			Usage: "directory used for storing IO FIFOs",
 		},
-	}, append(commands.SnapshotterFlags, ContainerFlags...)...),
+		cli.StringFlag{
+			Name:  "cgroup",
+			Usage: "cgroup path (To disable use of cgroup, set to \"\" explicitly)",
+		},
+	}, append(platformRunFlags, append(commands.SnapshotterFlags, commands.ContainerFlags...)...)...),
 	Action: func(context *cli.Context) error {
 		var (
 			err error
+			id  string
+			ref string
 
-			id     = context.Args().Get(1)
-			ref    = context.Args().First()
 			tty    = context.Bool("tty")
 			detach = context.Bool("detach")
+			config = context.IsSet("config")
 		)
 
-		if ref == "" {
-			return errors.New("image ref must be provided")
+		if config {
+			id = context.Args().First()
+			if context.NArg() > 1 {
+				return errors.New("with spec config file, only container id should be provided")
+			}
+		} else {
+			id = context.Args().Get(1)
+			ref = context.Args().First()
+
+			if ref == "" {
+				return errors.New("image ref must be provided")
+			}
 		}
 		if id == "" {
 			return errors.New("container id must be provided")
@@ -206,9 +155,17 @@ var Command = cli.Command{
 		if context.Bool("rm") && !detach {
 			defer container.Delete(ctx, containerd.WithSnapshotCleanup)
 		}
+		var con console.Console
+		if tty {
+			con = console.Current()
+			defer con.Reset()
+			if err := con.SetRaw(); err != nil {
+				return err
+			}
+		}
 		opts := getNewTaskOpts(context)
 		ioOpts := []cio.Opt{cio.WithFIFODir(context.String("fifo-dir"))}
-		task, err := tasks.NewTask(ctx, client, container, context.String("checkpoint"), tty, context.Bool("null-io"), ioOpts, opts...)
+		task, err := tasks.NewTask(ctx, client, container, context.String("checkpoint"), con, context.Bool("null-io"), context.String("log-uri"), ioOpts, opts...)
 		if err != nil {
 			return err
 		}
@@ -221,14 +178,6 @@ var Command = cli.Command{
 		}
 		if context.IsSet("pid-file") {
 			if err := commands.WritePidFile(context.String("pid-file"), int(task.Pid())); err != nil {
-				return err
-			}
-		}
-		var con console.Console
-		if tty {
-			con = console.Current()
-			defer con.Reset()
-			if err := con.SetRaw(); err != nil {
 				return err
 			}
 		}

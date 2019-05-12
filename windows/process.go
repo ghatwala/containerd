@@ -121,7 +121,7 @@ func (p *process) HcsPid() uint32 {
 
 func (p *process) ExitCode() (uint32, time.Time, error) {
 	if s := p.Status(); s != runtime.StoppedStatus && s != runtime.CreatedStatus {
-		return 255, time.Time{}, errors.Wrapf(errdefs.ErrFailedPrecondition, "process is not stopped: %s", s)
+		return 255, time.Time{}, errors.Wrapf(errdefs.ErrFailedPrecondition, "process is not stopped: %d", s)
 	}
 	return p.exitCode, p.exitTime, nil
 }
@@ -227,6 +227,24 @@ func (p *process) Wait(ctx context.Context) (*runtime.Exit, error) {
 		return nil, err
 	}
 	return &runtime.Exit{
+		Status:    ec,
+		Timestamp: ea,
+	}, nil
+}
+
+func (p *process) Delete(ctx context.Context) (*runtime.Exit, error) {
+	ec, ea, err := p.ExitCode()
+	if err != nil {
+		return nil, err
+	}
+	// If we never started the process close the pipes
+	if p.Status() == runtime.CreatedStatus {
+		p.io.Close()
+		ea = time.Now()
+	}
+	p.task.removeProcess(p.id)
+	return &runtime.Exit{
+		Pid:       p.pid,
 		Status:    ec,
 		Timestamp: ea,
 	}, nil

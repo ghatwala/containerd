@@ -19,6 +19,7 @@ package server
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"path/filepath"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	cni "github.com/containerd/go-cni"
 	runcapparmor "github.com/opencontainers/runc/libcontainer/apparmor"
 	runcseccomp "github.com/opencontainers/runc/libcontainer/seccomp"
+	runcsystem "github.com/opencontainers/runc/libcontainer/system"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -107,16 +109,22 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 	c := &criService{
 		config:             config,
 		client:             client,
-		apparmorEnabled:    runcapparmor.IsEnabled(),
+		apparmorEnabled:    runcapparmor.IsEnabled() && !config.DisableApparmor,
 		seccompEnabled:     runcseccomp.IsEnabled(),
 		os:                 osinterface.RealOS{},
 		sandboxStore:       sandboxstore.NewStore(),
 		containerStore:     containerstore.NewStore(),
-		imageStore:         imagestore.NewStore(),
+		imageStore:         imagestore.NewStore(client),
 		snapshotStore:      snapshotstore.NewStore(),
 		sandboxNameIndex:   registrar.NewRegistrar(),
 		containerNameIndex: registrar.NewRegistrar(),
 		initialized:        atomic.NewBool(false),
+	}
+
+	if runcsystem.RunningInUserNS() {
+		if !(config.DisableCgroup && !c.apparmorEnabled && config.RestrictOOMScoreAdj) {
+			logrus.Warn("Running containerd in a user namespace typically requires disable_cgroup, disable_apparmor, restrict_oom_score_adj set to be true")
+		}
 	}
 
 	if c.config.EnableSelinux {
@@ -125,6 +133,10 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 		}
 	} else {
 		selinux.SetDisabled()
+	}
+
+	if client.SnapshotService(c.config.ContainerdConfig.Snapshotter) == nil {
+		return nil, errors.Errorf("failed to find snapshotter %q", c.config.ContainerdConfig.Snapshotter)
 	}
 
 	c.imageFSPath = imageFSPath(config.ContainerdRootDir, config.ContainerdConfig.Snapshotter)
@@ -143,16 +155,16 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 
 	// Try to load the config if it exists. Just log the error if load fails
 	// This is not disruptive for containerd to panic
-	if err := c.netPlugin.Load(cni.WithLoNetwork(), cni.WithDefaultConf()); err != nil {
+	if err := c.netPlugin.Load(cni.WithLoNetwork, cni.WithDefaultConf); err != nil {
 		logrus.WithError(err).Error("Failed to load cni during init, please check CRI plugin status before setting up network for pods")
 	}
 	// prepare streaming server
-	c.streamServer, err = newStreamServer(c, config.StreamServerAddress, config.StreamServerPort)
+	c.streamServer, err = newStreamServer(c, config.StreamServerAddress, config.StreamServerPort, config.StreamIdleTimeout)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create stream server")
 	}
 
-	c.eventMonitor = newEventMonitor(c.containerStore, c.sandboxStore)
+	c.eventMonitor = newEventMonitor(c)
 
 	return c, nil
 }
@@ -179,10 +191,7 @@ func (c *criService) Run() error {
 
 	// Start event handler.
 	logrus.Info("Start event monitor")
-	eventMonitorCloseCh, err := c.eventMonitor.start()
-	if err != nil {
-		return errors.Wrap(err, "failed to start event monitor")
-	}
+	eventMonitorErrCh := c.eventMonitor.start()
 
 	// Start snapshot stats syncer, it doesn't need to be stopped.
 	logrus.Info("Start snapshots syncer")
@@ -195,27 +204,32 @@ func (c *criService) Run() error {
 
 	// Start streaming server.
 	logrus.Info("Start streaming server")
-	streamServerCloseCh := make(chan struct{})
+	streamServerErrCh := make(chan error)
 	go func() {
-		if err := c.streamServer.Start(true); err != nil {
+		defer close(streamServerErrCh)
+		if err := c.streamServer.Start(true); err != nil && err != http.ErrServerClosed {
 			logrus.WithError(err).Error("Failed to start streaming server")
+			streamServerErrCh <- err
 		}
-		close(streamServerCloseCh)
 	}()
 
 	// Set the server as initialized. GRPC services could start serving traffic.
 	c.initialized.Set()
 
+	var eventMonitorErr, streamServerErr error
 	// Stop the whole CRI service if any of the critical service exits.
 	select {
-	case <-eventMonitorCloseCh:
-	case <-streamServerCloseCh:
+	case eventMonitorErr = <-eventMonitorErrCh:
+	case streamServerErr = <-streamServerErrCh:
 	}
 	if err := c.Close(); err != nil {
 		return errors.Wrap(err, "failed to stop cri service")
 	}
-
-	<-eventMonitorCloseCh
+	// If the error is set above, err from channel must be nil here, because
+	// the channel is supposed to be closed. Or else, we wait and set it.
+	if err := <-eventMonitorErrCh; err != nil {
+		eventMonitorErr = err
+	}
 	logrus.Info("Event monitor stopped")
 	// There is a race condition with http.Server.Serve.
 	// When `Close` is called at the same time with `Serve`, `Close`
@@ -227,18 +241,27 @@ func (c *criService) Run() error {
 	// is fixed.
 	const streamServerStopTimeout = 2 * time.Second
 	select {
-	case <-streamServerCloseCh:
+	case err := <-streamServerErrCh:
+		if err != nil {
+			streamServerErr = err
+		}
 		logrus.Info("Stream server stopped")
 	case <-time.After(streamServerStopTimeout):
 		logrus.Errorf("Stream server is not stopped in %q", streamServerStopTimeout)
 	}
+	if eventMonitorErr != nil {
+		return errors.Wrap(eventMonitorErr, "event monitor error")
+	}
+	if streamServerErr != nil {
+		return errors.Wrap(streamServerErr, "stream server error")
+	}
 	return nil
 }
 
-// Stop stops the CRI service.
+// Close stops the CRI service.
+// TODO(random-liu): Make close synchronous.
 func (c *criService) Close() error {
 	logrus.Info("Stop CRI service")
-	// TODO(random-liu): Make event monitor stop synchronous.
 	c.eventMonitor.stop()
 	if err := c.streamServer.Stop(); err != nil {
 		return errors.Wrap(err, "failed to stop stream server")

@@ -19,20 +19,21 @@ package server
 import (
 	"encoding/base64"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
 	containerdimages "github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/reference"
+	"github.com/containerd/containerd/remotes"
+	"github.com/containerd/containerd/remotes/docker"
+	distribution "github.com/docker/distribution/reference"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
-
-	containerdresolver "github.com/containerd/cri/pkg/containerd/resolver"
-	imagestore "github.com/containerd/cri/pkg/store/image"
-	"github.com/containerd/cri/pkg/util"
 )
 
 // For image management:
@@ -59,11 +60,11 @@ import (
 // if we saw an image without snapshots or with in-complete contents during startup,
 // should we re-pull the image? Or should we remove the entry?
 //
-// yanxuean: We cann't delete image directly, because we don't know if the image
+// yanxuean: We can't delete image directly, because we don't know if the image
 // is pulled by us. There are resource leakage.
 //
 // 2) Containerd suggests user to add entry before pulling the image. However if
-// an error occurrs during the pulling, should we remove the entry from metadata
+// an error occurs during the pulling, should we remove the entry from metadata
 // store? Or should we leave it there until next startup (resource leakage)?
 //
 // 3) The cri plugin only exposes "READY" (successfully pulled and unpacked) images
@@ -79,7 +80,7 @@ import (
 // PullImage pulls an image with authentication config.
 func (c *criService) PullImage(ctx context.Context, r *runtime.PullImageRequest) (*runtime.PullImageResponse, error) {
 	imageRef := r.GetImage().GetImage()
-	namedRef, err := util.NormalizeImageRef(imageRef)
+	namedRef, err := distribution.ParseDockerRef(imageRef)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to parse image reference %q", imageRef)
 	}
@@ -87,12 +88,7 @@ func (c *criService) PullImage(ctx context.Context, r *runtime.PullImageRequest)
 	if ref != imageRef {
 		logrus.Debugf("PullImage using normalized image ref: %q", ref)
 	}
-	resolver := containerdresolver.NewResolver(containerdresolver.Options{
-		Credentials: func(string) (string, string, error) { return ParseAuth(r.GetAuth()) },
-		Client:      http.DefaultClient,
-		Registry:    c.getResolverOptions(),
-	})
-	_, desc, err := resolver.Resolve(ctx, ref)
+	resolver, desc, err := c.getResolver(ctx, ref, c.credentials(r.GetAuth()))
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to resolve image %q", ref)
 	}
@@ -100,65 +96,46 @@ func (c *criService) PullImage(ctx context.Context, r *runtime.PullImageRequest)
 	// image has already been converted.
 	isSchema1 := desc.MediaType == containerdimages.MediaTypeDockerSchema1Manifest
 
-	// TODO(mikebrow): add truncIndex for image id
 	image, err := c.client.Pull(ctx, ref,
 		containerd.WithSchema1Conversion,
 		containerd.WithResolver(resolver),
+		containerd.WithPullSnapshotter(c.config.ContainerdConfig.Snapshotter),
+		containerd.WithPullUnpack,
 	)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to pull image %q", ref)
+		return nil, errors.Wrapf(err, "failed to pull and unpack image %q", ref)
 	}
 
-	// Do best effort unpack.
-	logrus.Debugf("Unpack image %q", imageRef)
-	if err := image.Unpack(ctx, c.config.ContainerdConfig.Snapshotter); err != nil {
-		logrus.WithError(err).Warnf("Failed to unpack image %q", imageRef)
-		// Do not fail image pulling. Unpack will be retried before container creation.
-	}
-
-	// Get image information.
-	info, err := getImageInfo(ctx, image)
+	configDesc, err := image.Config(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get image information")
+		return nil, errors.Wrap(err, "get image config descriptor")
 	}
-	imageID := info.id
+	imageID := configDesc.Digest.String()
 
 	repoDigest, repoTag := getRepoDigestAndTag(namedRef, image.Target().Digest, isSchema1)
-	for _, r := range []string{repoTag, repoDigest, imageID} {
+	for _, r := range []string{imageID, repoTag, repoDigest} {
 		if r == "" {
 			continue
 		}
 		if err := c.createImageReference(ctx, r, image.Target()); err != nil {
-			return nil, errors.Wrapf(err, "failed to update image reference %q", r)
+			return nil, errors.Wrapf(err, "failed to create image reference %q", r)
+		}
+		// Update image store to reflect the newest state in containerd.
+		// No need to use `updateImage`, because the image reference must
+		// have been managed by the cri plugin.
+		if err := c.imageStore.Update(ctx, r); err != nil {
+			return nil, errors.Wrapf(err, "failed to update image store %q", r)
 		}
 	}
 
 	logrus.Debugf("Pulled image %q with image id %q, repo tag %q, repo digest %q", imageRef, imageID,
 		repoTag, repoDigest)
-	img := imagestore.Image{
-		ID:        imageID,
-		ChainID:   info.chainID.String(),
-		Size:      info.size,
-		ImageSpec: info.imagespec,
-		Image:     image,
-	}
-	if repoDigest != "" {
-		img.RepoDigests = []string{repoDigest}
-	}
-	if repoTag != "" {
-		img.RepoTags = []string{repoTag}
-	}
-
-	if err := c.imageStore.Add(img); err != nil {
-		return nil, errors.Wrapf(err, "failed to add image %q into store", img.ID)
-	}
-
 	// NOTE(random-liu): the actual state in containerd is the source of truth, even we maintain
 	// in-memory image store, it's only for in-memory indexing. The image could be removed
 	// by someone else anytime, before/during/after we create the metadata. We should always
 	// check the actual state in containerd before using the image or returning status of the
 	// image.
-	return &runtime.PullImageResponse{ImageRef: img.ID}, nil
+	return &runtime.PullImageResponse{ImageRef: imageID}, nil
 }
 
 // ParseAuth parses AuthConfig and returns username and password/secret required by containerd.
@@ -198,24 +175,110 @@ func (c *criService) createImageReference(ctx context.Context, name string, desc
 	img := containerdimages.Image{
 		Name:   name,
 		Target: desc,
+		// Add a label to indicate that the image is managed by the cri plugin.
+		Labels: map[string]string{imageLabelKey: imageLabelValue},
 	}
 	// TODO(random-liu): Figure out which is the more performant sequence create then update or
 	// update then create.
-	_, err := c.client.ImageService().Create(ctx, img)
-	if err == nil {
-		return nil
-	}
-	if err != nil && !errdefs.IsAlreadyExists(err) {
+	oldImg, err := c.client.ImageService().Create(ctx, img)
+	if err == nil || !errdefs.IsAlreadyExists(err) {
 		return err
 	}
-	_, err = c.client.ImageService().Update(ctx, img, "target")
+	if oldImg.Target.Digest == img.Target.Digest && oldImg.Labels[imageLabelKey] == imageLabelValue {
+		return nil
+	}
+	_, err = c.client.ImageService().Update(ctx, img, "target", "labels")
 	return err
 }
 
-func (c *criService) getResolverOptions() map[string][]string {
-	options := make(map[string][]string)
-	for ns, mirror := range c.config.Mirrors {
-		options[ns] = append(options[ns], mirror.Endpoints...)
+// updateImage updates image store to reflect the newest state of an image reference
+// in containerd. If the reference is not managed by the cri plugin, the function also
+// generates necessary metadata for the image and make it managed.
+func (c *criService) updateImage(ctx context.Context, r string) error {
+	img, err := c.client.GetImage(ctx, r)
+	if err != nil && !errdefs.IsNotFound(err) {
+		return errors.Wrap(err, "get image by reference")
 	}
-	return options
+	if err == nil && img.Labels()[imageLabelKey] != imageLabelValue {
+		// Make sure the image has the image id as its unique
+		// identifier that references the image in its lifetime.
+		configDesc, err := img.Config(ctx)
+		if err != nil {
+			return errors.Wrap(err, "get image id")
+		}
+		id := configDesc.Digest.String()
+		if err := c.createImageReference(ctx, id, img.Target()); err != nil {
+			return errors.Wrapf(err, "create image id reference %q", id)
+		}
+		if err := c.imageStore.Update(ctx, id); err != nil {
+			return errors.Wrapf(err, "update image store for %q", id)
+		}
+		// The image id is ready, add the label to mark the image as managed.
+		if err := c.createImageReference(ctx, r, img.Target()); err != nil {
+			return errors.Wrap(err, "create managed label")
+		}
+	}
+	// If the image is not found, we should continue updating the cache,
+	// so that the image can be removed from the cache.
+	if err := c.imageStore.Update(ctx, r); err != nil {
+		return errors.Wrapf(err, "update image store for %q", r)
+	}
+	return nil
+}
+
+// credentials returns a credential function for docker resolver to use.
+func (c *criService) credentials(auth *runtime.AuthConfig) func(string) (string, string, error) {
+	return func(host string) (string, string, error) {
+		if auth == nil {
+			// Get default auth from config.
+			for h, ac := range c.config.Registry.Auths {
+				u, err := url.Parse(h)
+				if err != nil {
+					return "", "", errors.Wrapf(err, "parse auth host %q", h)
+				}
+				if u.Host == host {
+					auth = toRuntimeAuthConfig(ac)
+					break
+				}
+			}
+		}
+		return ParseAuth(auth)
+	}
+}
+
+// getResolver tries registry mirrors and the default registry, and returns the resolver and descriptor
+// from the first working registry.
+func (c *criService) getResolver(ctx context.Context, ref string, cred func(string) (string, string, error)) (remotes.Resolver, imagespec.Descriptor, error) {
+	refspec, err := reference.Parse(ref)
+	if err != nil {
+		return nil, imagespec.Descriptor{}, errors.Wrap(err, "parse image reference")
+	}
+	// Try mirrors in order first, and then try default host name.
+	for _, e := range c.config.Registry.Mirrors[refspec.Hostname()].Endpoints {
+		u, err := url.Parse(e)
+		if err != nil {
+			return nil, imagespec.Descriptor{}, errors.Wrapf(err, "parse registry endpoint %q", e)
+		}
+		resolver := docker.NewResolver(docker.ResolverOptions{
+			Authorizer: docker.NewAuthorizer(http.DefaultClient, cred),
+			Client:     http.DefaultClient,
+			Host:       func(string) (string, error) { return u.Host, nil },
+			// By default use "https".
+			PlainHTTP: u.Scheme == "http",
+		})
+		_, desc, err := resolver.Resolve(ctx, ref)
+		if err == nil {
+			return resolver, desc, nil
+		}
+		// Continue to try next endpoint
+	}
+	resolver := docker.NewResolver(docker.ResolverOptions{
+		Credentials: cred,
+		Client:      http.DefaultClient,
+	})
+	_, desc, err := resolver.Resolve(ctx, ref)
+	if err != nil {
+		return nil, imagespec.Descriptor{}, errors.Wrap(err, "no available registry endpoint")
+	}
+	return resolver, desc, nil
 }

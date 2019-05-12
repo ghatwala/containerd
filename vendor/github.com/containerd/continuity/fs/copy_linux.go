@@ -1,3 +1,19 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
 package fs
 
 import (
@@ -49,20 +65,26 @@ func copyFileContent(dst, src *os.File) error {
 		return errors.Wrap(err, "unable to stat source")
 	}
 
-	n, err := unix.CopyFileRange(int(src.Fd()), nil, int(dst.Fd()), nil, int(st.Size()), 0)
-	if err != nil {
-		if err != unix.ENOSYS && err != unix.EXDEV {
-			return errors.Wrap(err, "copy file range failed")
+	size := st.Size()
+	first := true
+	srcFd := int(src.Fd())
+	dstFd := int(dst.Fd())
+
+	for size > 0 {
+		n, err := unix.CopyFileRange(srcFd, nil, dstFd, nil, int(size), 0)
+		if err != nil {
+			if (err != unix.ENOSYS && err != unix.EXDEV) || !first {
+				return errors.Wrap(err, "copy file range failed")
+			}
+
+			buf := bufferPool.Get().(*[]byte)
+			_, err = io.CopyBuffer(dst, src, *buf)
+			bufferPool.Put(buf)
+			return errors.Wrap(err, "userspace copy failed")
 		}
 
-		buf := bufferPool.Get().(*[]byte)
-		_, err = io.CopyBuffer(dst, src, *buf)
-		bufferPool.Put(buf)
-		return err
-	}
-
-	if int64(n) != st.Size() {
-		return errors.Wrapf(err, "short copy: %d of %d", int64(n), st.Size())
+		first = false
+		size -= int64(n)
 	}
 
 	return nil

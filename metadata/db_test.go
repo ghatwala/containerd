@@ -30,7 +30,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/content/local"
@@ -44,6 +43,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	bolt "go.etcd.io/bbolt"
 )
 
 func testDB(t *testing.T) (context.Context, *DB, func()) {
@@ -262,6 +262,16 @@ func TestMigrations(t *testing.T) {
 					return errors.New("deprecated ingest bucket still exists")
 				}
 
+				return nil
+			},
+		},
+
+		{
+			name: "NoOp",
+			init: func(tx *bolt.Tx) error {
+				return nil
+			},
+			check: func(tx *bolt.Tx) error {
 				return nil
 			},
 		},
@@ -506,7 +516,9 @@ func create(obj object, tx *bolt.Tx, is images.Store, cs content.Store, sn snaps
 	case testContent:
 		ctx := WithTransactionContext(ctx, tx)
 		expected := digest.FromBytes(v.data)
-		w, err := cs.Writer(ctx, "test-ref", int64(len(v.data)), expected)
+		w, err := cs.Writer(ctx,
+			content.WithRef("test-ref"),
+			content.WithDescriptor(ocispec.Descriptor{Size: int64(len(v.data)), Digest: expected}))
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create writer")
 		}

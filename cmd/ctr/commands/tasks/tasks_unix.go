@@ -20,6 +20,7 @@ package tasks
 
 import (
 	gocontext "context"
+	"net/url"
 	"os"
 	"os/signal"
 
@@ -67,27 +68,33 @@ func HandleConsoleResize(ctx gocontext.Context, task resizer, con console.Consol
 }
 
 // NewTask creates a new task
-func NewTask(ctx gocontext.Context, client *containerd.Client, container containerd.Container, checkpoint string, tty, nullIO bool, ioOpts []cio.Opt, opts ...containerd.NewTaskOpts) (containerd.Task, error) {
+func NewTask(ctx gocontext.Context, client *containerd.Client, container containerd.Container, checkpoint string, con console.Console, nullIO bool, logURI string, ioOpts []cio.Opt, opts ...containerd.NewTaskOpts) (containerd.Task, error) {
 	stdio := cio.NewCreator(append([]cio.Opt{cio.WithStdio}, ioOpts...)...)
-	if checkpoint == "" {
-		ioCreator := stdio
-		if tty {
-			ioCreator = cio.NewCreator(append([]cio.Opt{cio.WithStdio, cio.WithTerminal}, ioOpts...)...)
+	if checkpoint != "" {
+		im, err := client.GetImage(ctx, checkpoint)
+		if err != nil {
+			return nil, err
 		}
-		if nullIO {
-			if tty {
-				return nil, errors.New("tty and null-io cannot be used together")
-			}
-			ioCreator = cio.NullIO
+		opts = append(opts, containerd.WithTaskCheckpoint(im))
+	}
+	ioCreator := stdio
+	if con != nil {
+		ioCreator = cio.NewCreator(append([]cio.Opt{cio.WithStreams(con, con, nil), cio.WithTerminal}, ioOpts...)...)
+	}
+	if nullIO {
+		if con != nil {
+			return nil, errors.New("tty and null-io cannot be used together")
 		}
-		return container.NewTask(ctx, ioCreator, opts...)
+		ioCreator = cio.NullIO
 	}
-	im, err := client.GetImage(ctx, checkpoint)
-	if err != nil {
-		return nil, err
+	if logURI != "" {
+		u, err := url.Parse(logURI)
+		if err != nil {
+			return nil, err
+		}
+		ioCreator = cio.LogURI(u)
 	}
-	opts = append(opts, containerd.WithTaskCheckpoint(im))
-	return container.NewTask(ctx, stdio, opts...)
+	return container.NewTask(ctx, ioCreator, opts...)
 }
 
 func getNewTaskOpts(context *cli.Context) []containerd.NewTaskOpts {

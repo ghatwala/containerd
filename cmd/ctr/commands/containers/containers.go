@@ -18,16 +18,19 @@ package containers
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/cmd/ctr/commands"
 	"github.com/containerd/containerd/cmd/ctr/commands/run"
+	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/typeurl"
+	"github.com/pkg/errors"
 	"github.com/urfave/cli"
 )
 
@@ -42,21 +45,34 @@ var Command = cli.Command{
 		infoCommand,
 		listCommand,
 		setLabelsCommand,
+		checkpointCommand,
+		restoreCommand,
 	},
 }
 
 var createCommand = cli.Command{
 	Name:      "create",
 	Usage:     "create container",
-	ArgsUsage: "[flags] Image|RootFS CONTAINER",
-	Flags:     append(commands.SnapshotterFlags, run.ContainerFlags...),
+	ArgsUsage: "[flags] Image|RootFS CONTAINER [COMMAND] [ARG...]",
+	Flags:     append(commands.SnapshotterFlags, commands.ContainerFlags...),
 	Action: func(context *cli.Context) error {
 		var (
-			id  = context.Args().Get(1)
-			ref = context.Args().First()
+			id     string
+			ref    string
+			config = context.IsSet("config")
 		)
-		if ref == "" {
-			return errors.New("image ref must be provided")
+
+		if config {
+			id = context.Args().First()
+			if context.NArg() > 1 {
+				return errors.New("with spec config file, only container id should be provided")
+			}
+		} else {
+			id = context.Args().Get(1)
+			ref = context.Args().First()
+			if ref == "" {
+				return errors.New("image ref must be provided")
+			}
 		}
 		if id == "" {
 			return errors.New("container id must be provided")
@@ -108,7 +124,7 @@ var listCommand = cli.Command{
 		w := tabwriter.NewWriter(os.Stdout, 4, 8, 4, ' ', 0)
 		fmt.Fprintln(w, "CONTAINER\tIMAGE\tRUNTIME\t")
 		for _, c := range containers {
-			info, err := c.Info(ctx)
+			info, err := c.Info(ctx, containerd.WithoutRefreshedMetadata)
 			if err != nil {
 				return err
 			}
@@ -162,7 +178,6 @@ var deleteCommand = cli.Command{
 				log.G(ctx).WithError(err).Errorf("failed to delete container %q", arg)
 			}
 		}
-
 		return exitErr
 	},
 }
@@ -172,7 +187,7 @@ func deleteContainer(ctx context.Context, client *containerd.Client, id string, 
 	if err != nil {
 		return err
 	}
-	task, err := container.Task(ctx, nil)
+	task, err := container.Task(ctx, cio.Load)
 	if err != nil {
 		return container.Delete(ctx, opts...)
 	}
@@ -246,12 +261,26 @@ var infoCommand = cli.Command{
 		if err != nil {
 			return err
 		}
-		info, err := container.Info(ctx)
+		info, err := container.Info(ctx, containerd.WithoutRefreshedMetadata)
 		if err != nil {
 			return err
 		}
-		commands.PrintAsJSON(info)
 
+		if info.Spec != nil && info.Spec.Value != nil {
+			v, err := typeurl.UnmarshalAny(info.Spec)
+			if err != nil {
+				return err
+			}
+			commands.PrintAsJSON(struct {
+				containers.Container
+				Spec interface{} `json:"Spec,omitempty"`
+			}{
+				Container: info,
+				Spec:      v,
+			})
+			return nil
+		}
+		commands.PrintAsJSON(info)
 		return nil
 	},
 }

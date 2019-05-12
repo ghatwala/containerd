@@ -22,6 +22,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
@@ -32,6 +33,8 @@ import (
 
 	_ "crypto/sha256"
 
+	"github.com/containerd/containerd/archive/tartest"
+	"github.com/containerd/containerd/pkg/testutil"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/pkg/errors"
@@ -182,8 +185,52 @@ func TestSymlinks(t *testing.T) {
 	}
 }
 
+func TestTarWithXattr(t *testing.T) {
+	testutil.RequiresRoot(t)
+
+	fileXattrExist := func(f1, xattrKey, xattrValue string) func(string) error {
+		return func(root string) error {
+			values, err := getxattr(filepath.Join(root, f1), xattrKey)
+			if err != nil {
+				return err
+			}
+			if xattrValue != string(values) {
+				return fmt.Errorf("file xattrs expect to be %s, actually get %s", xattrValue, values)
+			}
+			return nil
+		}
+	}
+
+	tests := []struct {
+		name  string
+		key   string
+		value string
+		err   error
+	}{
+		{
+			name:  "WithXattrsUser",
+			key:   "user.key",
+			value: "value",
+		},
+		{
+			// security related xattrs need root permission to test
+			name:  "WithXattrSelinux",
+			key:   "security.selinux",
+			value: "unconfined_u:object_r:default_t:s0\x00",
+		},
+	}
+	for _, at := range tests {
+		tc := tartest.TarContext{}.WithUIDGID(os.Getuid(), os.Getgid()).WithModTime(time.Now().UTC()).WithXattrs(map[string]string{
+			at.key: at.value,
+		})
+		w := tartest.TarAll(tc.File("/file", []byte{}, 0755))
+		validator := fileXattrExist("file", at.key, at.value)
+		t.Run(at.name, makeWriterToTarTest(w, nil, validator, at.err))
+	}
+}
+
 func TestBreakouts(t *testing.T) {
-	tc := TarContext{}.WithUIDGID(os.Getuid(), os.Getgid()).WithModTime(time.Now().UTC())
+	tc := tartest.TarContext{}.WithUIDGID(os.Getuid(), os.Getgid()).WithModTime(time.Now().UTC())
 	expected := "unbroken"
 	unbrokenCheck := func(root string) error {
 		b, err := ioutil.ReadFile(filepath.Join(root, "etc", "unbroken"))
@@ -196,6 +243,49 @@ func TestBreakouts(t *testing.T) {
 		return nil
 	}
 	errFileDiff := errors.New("files differ")
+
+	isSymlinkFile := func(f string) func(string) error {
+		return func(root string) error {
+			fi, err := os.Lstat(filepath.Join(root, f))
+			if err != nil {
+				return err
+			}
+
+			if got := fi.Mode() & os.ModeSymlink; got != os.ModeSymlink {
+				return errors.Errorf("%s should be symlink", fi.Name())
+			}
+			return nil
+		}
+	}
+
+	sameSymlinkFile := func(f1, f2 string) func(string) error {
+		checkF1, checkF2 := isSymlinkFile(f1), isSymlinkFile(f2)
+		return func(root string) error {
+			if err := checkF1(root); err != nil {
+				return err
+			}
+
+			if err := checkF2(root); err != nil {
+				return err
+			}
+
+			t1, err := os.Readlink(filepath.Join(root, f1))
+			if err != nil {
+				return err
+			}
+
+			t2, err := os.Readlink(filepath.Join(root, f2))
+			if err != nil {
+				return err
+			}
+
+			if t1 != t2 {
+				return errors.Wrapf(errFileDiff, "%#v and %#v", t1, t2)
+			}
+			return nil
+		}
+	}
+
 	sameFile := func(f1, f2 string) func(string) error {
 		return func(root string) error {
 			p1, err := fs.RootPath(root, f1)
@@ -239,7 +329,7 @@ func TestBreakouts(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if bytes.Compare(b, content) != 0 {
+			if !bytes.Equal(b, content) {
 				return errors.Errorf("content differs: expected %v, got %v", content, b)
 			}
 			return nil
@@ -270,14 +360,14 @@ func TestBreakouts(t *testing.T) {
 
 	breakouts := []struct {
 		name      string
-		w         WriterToTar
+		w         tartest.WriterToTar
 		apply     fstest.Applier
 		validator func(string) error
 		err       error
 	}{
 		{
 			name: "SymlinkAbsolute",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0755),
 				tc.Symlink("/etc", "localetc"),
 				tc.File("/localetc/unbroken", []byte(expected), 0644),
@@ -286,7 +376,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "SymlinkUpAndOut",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0755),
 				tc.Dir("dummy", 0755),
 				tc.Symlink("/dummy/../etc", "localetc"),
@@ -296,7 +386,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "SymlinkMultipleAbsolute",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0755),
 				tc.Dir("dummy", 0755),
 				tc.Symlink("/etc", "/dummy/etc"),
@@ -307,7 +397,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "SymlinkMultipleRelative",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0755),
 				tc.Dir("dummy", 0755),
 				tc.Symlink("/etc", "/dummy/etc"),
@@ -318,7 +408,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "SymlinkEmptyFile",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0755),
 				tc.File("etc/emptied", []byte("notempty"), 0644),
 				tc.Symlink("/etc", "localetc"),
@@ -337,7 +427,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "HardlinkRelative",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Dir("breakouts", 0755),
@@ -348,7 +438,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "HardlinkDownAndOut",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Dir("breakouts", 0755),
@@ -360,7 +450,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "HardlinkAbsolute",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Symlink("/etc", "localetc"),
@@ -370,7 +460,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "HardlinkRelativeLong",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Symlink("../../../../../../../etc", "localetc"),
@@ -380,7 +470,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "HardlinkRelativeUpAndOut",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Symlink("upandout/../../../etc", "localetc"),
@@ -390,7 +480,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "HardlinkDirectRelative",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Link("../../../../../etc/passwd", "localpasswd"),
@@ -399,7 +489,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "HardlinkDirectAbsolute",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Link("/etc/passwd", "localpasswd"),
@@ -407,28 +497,44 @@ func TestBreakouts(t *testing.T) {
 			validator: sameFile("localpasswd", "/etc/passwd"),
 		},
 		{
+			name: "HardlinkSymlinkBeforeCreateTarget",
+			w: tartest.TarAll(
+				tc.Dir("etc", 0770),
+				tc.Symlink("/etc/passwd", "localpasswd"),
+				tc.Link("localpasswd", "localpasswd-dup"),
+				tc.File("/etc/passwd", []byte("after"), 0644),
+			),
+			validator: sameFile("localpasswd-dup", "/etc/passwd"),
+		},
+		{
 			name: "HardlinkSymlinkRelative",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Symlink("../../../../../etc/passwd", "passwdlink"),
 				tc.Link("/passwdlink", "localpasswd"),
 			),
-			validator: sameFile("/localpasswd", "/etc/passwd"),
+			validator: all(
+				sameSymlinkFile("/localpasswd", "/passwdlink"),
+				sameFile("/localpasswd", "/etc/passwd"),
+			),
 		},
 		{
 			name: "HardlinkSymlinkAbsolute",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Symlink("/etc/passwd", "passwdlink"),
 				tc.Link("/passwdlink", "localpasswd"),
 			),
-			validator: sameFile("/localpasswd", "/etc/passwd"),
+			validator: all(
+				sameSymlinkFile("/localpasswd", "/passwdlink"),
+				sameFile("/localpasswd", "/etc/passwd"),
+			),
 		},
 		{
 			name: "SymlinkParentDirectory",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Symlink("/etc/", ".."),
@@ -438,7 +544,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "SymlinkEmptyFilename",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Symlink("/etc/", ""),
@@ -448,7 +554,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "SymlinkParentRelative",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Symlink("/etc/", "localetc/sub/.."),
@@ -458,7 +564,7 @@ func TestBreakouts(t *testing.T) {
 		},
 		{
 			name: "SymlinkSlashEnded",
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("etc", 0770),
 				tc.File("/etc/passwd", []byte("inside"), 0644),
 				tc.Dir("localetc/", 0770),
@@ -473,7 +579,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateFile("/etc/passwd", []byte("inside"), 0644),
 				fstest.CreateDir("/localetc/", 0755),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Symlink("/etc", "localetc"),
 				tc.Link("/etc/passwd", "/localetc/localpasswd"),
 			),
@@ -486,7 +592,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateFile("/etc/passwd", []byte("inside"), 0644),
 				fstest.CreateDir("/localetc/", 0755),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Symlink("../../etc", "localetc"),
 				tc.Link("/etc/passwd", "/localetc/localpasswd"),
 			),
@@ -499,7 +605,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateFile("/etc/passwd", []byte("inside"), 0644),
 				fstest.Symlink("/etc", "localetc"),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("/localetc/", 0755),
 				tc.Link("/etc/passwd", "/localetc/localpasswd"),
 			),
@@ -513,7 +619,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.Symlink("etc", "localetc"),
 				fstest.Link("/etc/passwd", "/localetc/localpasswd"),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("/localetc/", 0755),
 				tc.File("/localetc/localpasswd", []byte("different"), 0644),
 			),
@@ -525,7 +631,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateDir("/etc/", 0755),
 				fstest.CreateFile("/etc/passwd", []byte("inside"), 0644),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.File(".wh...", []byte{}, 0644), // Should wipe out whole directory
 			),
 			err: errInvalidArchive,
@@ -536,7 +642,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateDir("/etc/", 0755),
 				fstest.CreateFile("/etc/passwd", []byte("inside"), 0644),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.File("etc/.wh...", []byte{}, 0644),
 			),
 			err: errInvalidArchive,
@@ -547,7 +653,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateDir("/etc/", 0755),
 				fstest.CreateFile("/etc/passwd", []byte("inside"), 0644),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.File(".wh..", []byte{}, 0644),
 			),
 			err: errInvalidArchive,
@@ -558,7 +664,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateDir("/etc/", 0755),
 				fstest.CreateFile("/etc/passwd", []byte("inside"), 0644),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.File("etc/.wh..", []byte{}, 0644), // Should wipe out whole directory
 			),
 			err: errInvalidArchive,
@@ -570,7 +676,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateFile("/etc/passwd", []byte("all users"), 0644),
 				fstest.Symlink("/etc", "localetc"),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.File(".wh.localetc", []byte{}, 0644), // Should wipe out whole directory
 			),
 			validator: all(
@@ -588,7 +694,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateFile("/etc/whitedout", []byte("ahhhh whiteout"), 0644),
 				fstest.Symlink("/etc", "localetc"),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.File("localetc/.wh.whitedout", []byte{}, 0644),
 			),
 			validator: all(
@@ -604,7 +710,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateFile("/etc/whitedout", []byte("ahhhh whiteout"), 0644),
 				fstest.Symlink("/etc", "localetc"),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.File(".wh.etc/somefile", []byte("non-empty"), 0644),
 			),
 			validator: all(
@@ -619,7 +725,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateFile("/etc/passwd", []byte("all users"), 0644),
 				fstest.Symlink("/dne", "localetc"),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.File("localetc/.wh.etc", []byte{}, 0644),
 			),
 			// no-op, remove does not
@@ -632,7 +738,7 @@ func TestBreakouts(t *testing.T) {
 				fstest.CreateFile("/etc/passwd", []byte("all users"), 0644),
 				fstest.Symlink("/dne", "localetc"),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.File("dne/../.wh.etc", []byte{}, 0644),
 			),
 			// resolution ends up just removing etc
@@ -650,7 +756,7 @@ func TestDiffApply(t *testing.T) {
 }
 
 func TestApplyTar(t *testing.T) {
-	tc := TarContext{}.WithUIDGID(os.Getuid(), os.Getgid()).WithModTime(time.Now().UTC())
+	tc := tartest.TarContext{}.WithUIDGID(os.Getuid(), os.Getgid()).WithModTime(time.Now().UTC())
 	directoriesExist := func(dirs ...string) func(string) error {
 		return func(root string) error {
 			for _, d := range dirs {
@@ -668,7 +774,7 @@ func TestApplyTar(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		w         WriterToTar
+		w         tartest.WriterToTar
 		apply     fstest.Applier
 		validator func(string) error
 		err       error
@@ -678,7 +784,7 @@ func TestApplyTar(t *testing.T) {
 			apply: fstest.Apply(
 				fstest.CreateDir("/etc/", 0755),
 			),
-			w: TarAll(
+			w: tartest.TarAll(
 				tc.Dir("/etc/subdir", 0755),
 				tc.Dir("/etc/subdir2/", 0755),
 				tc.Dir("/etc/subdir2/more", 0755),
@@ -807,7 +913,7 @@ func testDiffApply(appliers ...fstest.Applier) error {
 	return fstest.CheckDirectoryEqual(td, dest)
 }
 
-func makeWriterToTarTest(wt WriterToTar, a fstest.Applier, validate func(string) error, applyErr error) func(*testing.T) {
+func makeWriterToTarTest(wt tartest.WriterToTar, a fstest.Applier, validate func(string) error, applyErr error) func(*testing.T) {
 	return func(t *testing.T) {
 		td, err := ioutil.TempDir("", "test-writer-to-tar-")
 		if err != nil {
@@ -821,7 +927,7 @@ func makeWriterToTarTest(wt WriterToTar, a fstest.Applier, validate func(string)
 			}
 		}
 
-		tr := TarFromWriterTo(wt)
+		tr := tartest.TarFromWriterTo(wt)
 
 		if _, err := Apply(context.Background(), td, tr); err != nil {
 			if applyErr == nil {
@@ -1073,7 +1179,7 @@ func fileEntry(name string, expected []byte, mode int) tarEntryValidator {
 		if hdr.Mode != int64(mode) {
 			return errors.Errorf("wrong mode %o, expected %o", hdr.Mode, mode)
 		}
-		if bytes.Compare(b, expected) != 0 {
+		if !bytes.Equal(b, expected) {
 			return errors.Errorf("different file content")
 		}
 		return nil
@@ -1218,183 +1324,4 @@ func requireTar(t *testing.T) {
 	if _, err := exec.LookPath(tarCmd); err != nil {
 		t.Skipf("%s not found, skipping", tarCmd)
 	}
-}
-
-// WriterToTar is an type which writes to a tar writer
-type WriterToTar interface {
-	WriteTo(*tar.Writer) error
-}
-
-type writerToFn func(*tar.Writer) error
-
-func (w writerToFn) WriteTo(tw *tar.Writer) error {
-	return w(tw)
-}
-
-// TarAll creates a WriterToTar which calls all the provided writers
-// in the order in which they are provided.
-func TarAll(wt ...WriterToTar) WriterToTar {
-	return writerToFn(func(tw *tar.Writer) error {
-		for _, w := range wt {
-			if err := w.WriteTo(tw); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-// TarFromWriterTo is used to create a tar stream from a tar record
-// creator. This can be used to manifacture more specific tar records
-// which allow testing specific tar cases which may be encountered
-// by the untar process.
-func TarFromWriterTo(wt WriterToTar) io.ReadCloser {
-	r, w := io.Pipe()
-	go func() {
-		tw := tar.NewWriter(w)
-		if err := wt.WriteTo(tw); err != nil {
-			w.CloseWithError(err)
-			return
-		}
-		w.CloseWithError(tw.Close())
-	}()
-
-	return r
-}
-
-// TarContext is used to create tar records
-type TarContext struct {
-	UID int
-	GID int
-
-	// ModTime sets the modtimes for all files, if nil the current time
-	// is used for each file when it was written
-	ModTime *time.Time
-
-	Xattrs map[string]string
-}
-
-func (tc TarContext) newHeader(mode os.FileMode, name, link string, size int64) *tar.Header {
-	ti := tarInfo{
-		name: name,
-		mode: mode,
-		size: size,
-		modt: tc.ModTime,
-		hdr: &tar.Header{
-			Uid:    tc.UID,
-			Gid:    tc.GID,
-			Xattrs: tc.Xattrs,
-		},
-	}
-
-	if mode&os.ModeSymlink == 0 && link != "" {
-		ti.hdr.Typeflag = tar.TypeLink
-		ti.hdr.Linkname = link
-	}
-
-	hdr, err := tar.FileInfoHeader(ti, link)
-	if err != nil {
-		// Only returns an error on bad input mode
-		panic(err)
-	}
-
-	return hdr
-}
-
-type tarInfo struct {
-	name string
-	mode os.FileMode
-	size int64
-	modt *time.Time
-	hdr  *tar.Header
-}
-
-func (ti tarInfo) Name() string {
-	return ti.name
-}
-
-func (ti tarInfo) Size() int64 {
-	return ti.size
-}
-func (ti tarInfo) Mode() os.FileMode {
-	return ti.mode
-}
-
-func (ti tarInfo) ModTime() time.Time {
-	if ti.modt != nil {
-		return *ti.modt
-	}
-	return time.Now().UTC()
-}
-
-func (ti tarInfo) IsDir() bool {
-	return (ti.mode & os.ModeDir) != 0
-}
-func (ti tarInfo) Sys() interface{} {
-	return ti.hdr
-}
-
-func (tc TarContext) WithUIDGID(uid, gid int) TarContext {
-	ntc := tc
-	ntc.UID = uid
-	ntc.GID = gid
-	return ntc
-}
-
-func (tc TarContext) WithModTime(modtime time.Time) TarContext {
-	ntc := tc
-	ntc.ModTime = &modtime
-	return ntc
-}
-
-// WithXattrs adds these xattrs to all files, merges with any
-// previously added xattrs
-func (tc TarContext) WithXattrs(xattrs map[string]string) TarContext {
-	ntc := tc
-	if ntc.Xattrs == nil {
-		ntc.Xattrs = map[string]string{}
-	}
-	for k, v := range xattrs {
-		ntc.Xattrs[k] = v
-	}
-	return ntc
-}
-
-func (tc TarContext) File(name string, content []byte, perm os.FileMode) WriterToTar {
-	return writerToFn(func(tw *tar.Writer) error {
-		return writeHeaderAndContent(tw, tc.newHeader(perm, name, "", int64(len(content))), content)
-	})
-}
-
-func (tc TarContext) Dir(name string, perm os.FileMode) WriterToTar {
-	return writerToFn(func(tw *tar.Writer) error {
-		return writeHeaderAndContent(tw, tc.newHeader(perm|os.ModeDir, name, "", 0), nil)
-	})
-}
-
-func (tc TarContext) Symlink(oldname, newname string) WriterToTar {
-	return writerToFn(func(tw *tar.Writer) error {
-		return writeHeaderAndContent(tw, tc.newHeader(0777|os.ModeSymlink, newname, oldname, 0), nil)
-	})
-}
-
-func (tc TarContext) Link(oldname, newname string) WriterToTar {
-	return writerToFn(func(tw *tar.Writer) error {
-		return writeHeaderAndContent(tw, tc.newHeader(0777, newname, oldname, 0), nil)
-	})
-}
-
-func writeHeaderAndContent(tw *tar.Writer, h *tar.Header, b []byte) error {
-	if h.Size != int64(len(b)) {
-		return errors.New("bad content length")
-	}
-	if err := tw.WriteHeader(h); err != nil {
-		return err
-	}
-	if len(b) > 0 {
-		if _, err := tw.Write(b); err != nil {
-			return err
-		}
-	}
-	return nil
 }

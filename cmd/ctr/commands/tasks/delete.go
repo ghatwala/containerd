@@ -18,6 +18,7 @@ package tasks
 
 import (
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/cmd/ctr/commands"
 	"github.com/urfave/cli"
 )
@@ -31,8 +32,16 @@ var deleteCommand = cli.Command{
 			Name:  "force, f",
 			Usage: "force delete task process",
 		},
+		cli.StringFlag{
+			Name:  "exec-id",
+			Usage: "process ID to kill",
+		},
 	},
 	Action: func(context *cli.Context) error {
+		var (
+			execID = context.String("exec-id")
+			force  = context.Bool("force")
+		)
 		client, ctx, cancel, err := commands.NewClient(context)
 		if err != nil {
 			return err
@@ -42,21 +51,34 @@ var deleteCommand = cli.Command{
 		if err != nil {
 			return err
 		}
-
-		task, err := container.Task(ctx, nil)
+		task, err := container.Task(ctx, cio.Load)
 		if err != nil {
 			return err
 		}
 		var opts []containerd.ProcessDeleteOpts
-		if context.Bool("force") {
+		if force {
 			opts = append(opts, containerd.WithProcessKill)
 		}
-		status, err := task.Delete(ctx, opts...)
-		if err != nil {
-			return err
-		}
-		if ec := status.ExitCode(); ec != 0 {
-			return cli.NewExitError("", int(ec))
+		if execID != "" {
+			p, err := task.LoadProcess(ctx, execID, nil)
+			if err != nil {
+				return err
+			}
+			status, err := p.Delete(ctx, opts...)
+			if err != nil {
+				return err
+			}
+			if ec := status.ExitCode(); ec != 0 {
+				return cli.NewExitError("", int(ec))
+			}
+		} else {
+			status, err := task.Delete(ctx, opts...)
+			if err != nil {
+				return err
+			}
+			if ec := status.ExitCode(); ec != 0 {
+				return cli.NewExitError("", int(ec))
+			}
 		}
 		return nil
 	},

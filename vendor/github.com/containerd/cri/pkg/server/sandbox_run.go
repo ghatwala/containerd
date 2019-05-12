@@ -17,6 +17,7 @@ limitations under the License.
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -24,10 +25,10 @@ import (
 	"github.com/containerd/containerd"
 	containerdio "github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/linux/runctypes"
 	"github.com/containerd/containerd/oci"
 	cni "github.com/containerd/go-cni"
 	"github.com/containerd/typeurl"
+	"github.com/davecgh/go-spew/spew"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -41,6 +42,7 @@ import (
 	customopts "github.com/containerd/cri/pkg/containerd/opts"
 	ctrdutil "github.com/containerd/cri/pkg/containerd/util"
 	"github.com/containerd/cri/pkg/log"
+	"github.com/containerd/cri/pkg/netns"
 	sandboxstore "github.com/containerd/cri/pkg/store/sandbox"
 	"github.com/containerd/cri/pkg/util"
 )
@@ -54,10 +56,15 @@ func init() {
 // the sandbox is in ready state.
 func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (_ *runtime.RunPodSandboxResponse, retErr error) {
 	config := r.GetConfig()
+	logrus.Debugf("Sandbox config %+v", config)
 
 	// Generate unique id and name for the sandbox and reserve the name.
 	id := util.GenerateID()
-	name := makeSandboxName(config.GetMetadata())
+	metadata := config.GetMetadata()
+	if metadata == nil {
+		return nil, errors.New("sandbox config must include metadata")
+	}
+	name := makeSandboxName(metadata)
 	logrus.Debugf("Generated id %q for sandbox %q", id, name)
 	// Reserve the sandbox name to avoid concurrent `RunPodSandbox` request starting the
 	// same sandbox.
@@ -74,9 +81,10 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	// Create initial internal sandbox object.
 	sandbox := sandboxstore.NewSandbox(
 		sandboxstore.Metadata{
-			ID:     id,
-			Name:   name,
-			Config: config,
+			ID:             id,
+			Name:           name,
+			Config:         config,
+			RuntimeHandler: r.GetRuntimeHandler(),
 		},
 		sandboxstore.Status{
 			State: sandboxstore.StateUnknown,
@@ -88,6 +96,13 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get sandbox image %q", c.config.SandboxImage)
 	}
+
+	ociRuntime, err := c.getSandboxRuntime(config, r.GetRuntimeHandler())
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get sandbox runtime")
+	}
+	logrus.Debugf("Use OCI %+v for sandbox %q", ociRuntime, id)
+
 	securityContext := config.GetLinux().GetSecurityContext()
 	//Create Network Namespace if it is not in host network
 	hostNet := securityContext.GetNamespaceOptions().GetNetwork() == runtime.NamespaceMode_NODE
@@ -96,7 +111,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		// handle. NetNSPath in sandbox metadata and NetNS is non empty only for non host network
 		// namespaces. If the pod is in host network namespace then both are empty and should not
 		// be used.
-		sandbox.NetNS, err = sandboxstore.NewNetNS()
+		sandbox.NetNS, err = netns.NewNetNS()
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create network namespace for sandbox %q", id)
 		}
@@ -117,7 +132,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		// In this case however caching the IP will add a subtle performance enhancement by avoiding
 		// calls to network namespace of the pod to query the IP of the veth interface on every
 		// SandboxStatus request.
-		sandbox.IP, err = c.setupPod(id, sandbox.NetNSPath, config)
+		sandbox.IP, sandbox.CNIResult, err = c.setupPod(id, sandbox.NetNSPath, config)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to setup network for sandbox %q", id)
 		}
@@ -131,18 +146,12 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		}()
 	}
 
-	ociRuntime, err := c.getSandboxRuntime(config)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get sandbox runtime")
-	}
-	logrus.Debugf("Use OCI %+v for sandbox %q", ociRuntime, id)
-
 	// Create sandbox container.
-	spec, err := c.generateSandboxContainerSpec(id, config, &image.ImageSpec.Config, sandbox.NetNSPath)
+	spec, err := c.generateSandboxContainerSpec(id, config, &image.ImageSpec.Config, sandbox.NetNSPath, ociRuntime.PodAnnotations)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to generate sandbox container spec")
 	}
-	logrus.Debugf("Sandbox container spec: %+v", spec)
+	logrus.Debugf("Sandbox container %q spec: %#+v", id, spew.NewFormatter(spec))
 
 	var specOpts []oci.SpecOpts
 	userstr, err := generateUserString(
@@ -170,18 +179,17 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 
 	sandboxLabels := buildLabels(config.Labels, containerKindSandbox)
 
+	runtimeOpts, err := generateRuntimeOptions(ociRuntime, c.config)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to generate runtime options")
+	}
 	opts := []containerd.NewContainerOpts{
 		containerd.WithSnapshotter(c.config.ContainerdConfig.Snapshotter),
 		customopts.WithNewSnapshot(id, image.Image),
 		containerd.WithSpec(spec, specOpts...),
 		containerd.WithContainerLabels(sandboxLabels),
 		containerd.WithContainerExtension(sandboxMetadataExtension, &sandbox.Metadata),
-		containerd.WithRuntime(
-			ociRuntime.Type,
-			&runctypes.RuncOptions{
-				Runtime:       ociRuntime.Engine,
-				RuntimeRoot:   ociRuntime.Root,
-				SystemdCgroup: c.config.SystemdCgroup})} // TODO (mikebrow): add CriuPath when we add support for pause
+		containerd.WithRuntime(ociRuntime.Type, runtimeOpts)}
 
 	container, err := c.client.NewContainer(ctx, id, opts...)
 	if err != nil {
@@ -227,7 +235,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		}
 	}()
 
-	// Setup sandbox /dev/shm, /etc/hosts and /etc/resolv.conf.
+	// Setup sandbox /dev/shm, /etc/hosts, /etc/resolv.conf and /etc/hostname.
 	if err = c.setupSandboxFiles(id, config); err != nil {
 		return nil, errors.Wrapf(err, "failed to setup sandbox files")
 	}
@@ -245,182 +253,199 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get sandbox container info")
 	}
-	if err := sandbox.Status.Update(func(status sandboxstore.Status) (sandboxstore.Status, error) {
-		status.CreatedAt = info.CreatedAt
-		return status, nil
-	}); err != nil {
-		return nil, errors.Wrap(err, "failed to update sandbox created timestamp")
-	}
 
-	// Add sandbox into sandbox store in UNKNOWN state.
-	sandbox.Container = container
-	if err := c.sandboxStore.Add(sandbox); err != nil {
-		return nil, errors.Wrapf(err, "failed to add sandbox %+v into store", sandbox)
+	// Create sandbox task in containerd.
+	log.Tracef("Create sandbox container (id=%q, name=%q).",
+		id, name)
+
+	var taskOpts []containerd.NewTaskOpts
+	// TODO(random-liu): Remove this after shim v1 is deprecated.
+	if c.config.NoPivot && ociRuntime.Type == linuxRuntime {
+		taskOpts = append(taskOpts, containerd.WithNoPivotRoot)
+	}
+	// We don't need stdio for sandbox container.
+	task, err := container.NewTask(ctx, containerdio.NullIO, taskOpts...)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create containerd task")
 	}
 	defer func() {
-		// Delete sandbox from sandbox store if there is an error.
 		if retErr != nil {
-			c.sandboxStore.Delete(id)
+			deferCtx, deferCancel := ctrdutil.DeferContext()
+			defer deferCancel()
+			// Cleanup the sandbox container if an error is returned.
+			if _, err := task.Delete(deferCtx, containerd.WithProcessKill); err != nil && !errdefs.IsNotFound(err) {
+				logrus.WithError(err).Errorf("Failed to delete sandbox container %q", id)
+			}
 		}
 	}()
-	// NOTE(random-liu): Sandbox state only stay in UNKNOWN state after this point
-	// and before the end of this function.
-	// * If `Update` succeeds, sandbox state will become READY in one transaction.
-	// * If `Update` fails, sandbox will be removed from the store in the defer above.
-	// * If containerd stops at any point before `Update` finishes, because sandbox
-	// state is not checkpointed, it will be recovered from corresponding containerd task
-	// status during restart:
-	//   * If the task is running, sandbox state will be READY,
-	//   * Or else, sandbox state will be NOTREADY.
-	//
-	// In any case, sandbox will leave UNKNOWN state, so it's safe to ignore sandbox
-	// in UNKNOWN state in other functions.
 
-	// Start sandbox container in one transaction to avoid race condition with
-	// event monitor.
-	if err := sandbox.Status.Update(func(status sandboxstore.Status) (_ sandboxstore.Status, retErr error) {
-		// NOTE(random-liu): We should not change the sandbox state to NOTREADY
-		// if `Update` fails.
-		//
-		// If `Update` fails, the sandbox will be cleaned up by all the defers
-		// above. We should not let user see this sandbox, or else they will
-		// see the sandbox disappear after the defer clean up, which may confuse
-		// them.
-		//
-		// Given so, we should keep the sandbox in UNKNOWN state if `Update` fails,
-		// and ignore sandbox in UNKNOWN state in all the inspection functions.
+	// wait is a long running background request, no timeout needed.
+	exitCh, err := task.Wait(ctrdutil.NamespacedContext())
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to wait for sandbox container task")
+	}
 
-		// Create sandbox task in containerd.
-		log.Tracef("Create sandbox container (id=%q, name=%q).",
-			id, name)
-		// We don't need stdio for sandbox container.
-		task, err := container.NewTask(ctx, containerdio.NullIO)
-		if err != nil {
-			return status, errors.Wrap(err, "failed to create containerd task")
-		}
-		defer func() {
-			if retErr != nil {
-				deferCtx, deferCancel := ctrdutil.DeferContext()
-				defer deferCancel()
-				// Cleanup the sandbox container if an error is returned.
-				// It's possible that task is deleted by event monitor.
-				if _, err := task.Delete(deferCtx, containerd.WithProcessKill); err != nil && !errdefs.IsNotFound(err) {
-					logrus.WithError(err).Errorf("Failed to delete sandbox container %q", id)
-				}
-			}
-		}()
+	if err := task.Start(ctx); err != nil {
+		return nil, errors.Wrapf(err, "failed to start sandbox container task %q", id)
+	}
 
-		if err := task.Start(ctx); err != nil {
-			return status, errors.Wrapf(err, "failed to start sandbox container task %q", id)
-		}
-
+	if err := sandbox.Status.Update(func(status sandboxstore.Status) (sandboxstore.Status, error) {
 		// Set the pod sandbox as ready after successfully start sandbox container.
 		status.Pid = task.Pid()
 		status.State = sandboxstore.StateReady
+		status.CreatedAt = info.CreatedAt
 		return status, nil
 	}); err != nil {
-		return nil, errors.Wrap(err, "failed to start sandbox container")
+		return nil, errors.Wrap(err, "failed to update sandbox status")
 	}
+
+	// Add sandbox into sandbox store in INIT state.
+	sandbox.Container = container
+
+	if err := c.sandboxStore.Add(sandbox); err != nil {
+		return nil, errors.Wrapf(err, "failed to add sandbox %+v into store", sandbox)
+	}
+
+	// start the monitor after adding sandbox into the store, this ensures
+	// that sandbox is in the store, when event monitor receives the TaskExit event.
+	//
+	// TaskOOM from containerd may come before sandbox is added to store,
+	// but we don't care about sandbox TaskOOM right now, so it is fine.
+	c.eventMonitor.startExitMonitor(context.Background(), id, task.Pid(), exitCh)
 
 	return &runtime.RunPodSandboxResponse{PodSandboxId: id}, nil
 }
 
 func (c *criService) generateSandboxContainerSpec(id string, config *runtime.PodSandboxConfig,
-	imageConfig *imagespec.ImageConfig, nsPath string) (*runtimespec.Spec, error) {
+	imageConfig *imagespec.ImageConfig, nsPath string, runtimePodAnnotations []string) (*runtimespec.Spec, error) {
 	// Creates a spec Generator with the default spec.
 	// TODO(random-liu): [P1] Compare the default settings with docker and containerd default.
-	spec, err := defaultRuntimeSpec(id)
-	if err != nil {
-		return nil, err
+	specOpts := []oci.SpecOpts{
+		customopts.WithoutRunMount,
+		customopts.WithoutDefaultSecuritySettings,
+		customopts.WithRelativeRoot(relativeRootfsPath),
+		oci.WithEnv(imageConfig.Env),
+		oci.WithRootFSReadonly(),
+		oci.WithHostname(config.GetHostname()),
 	}
-	g := newSpecGenerator(spec)
-
-	// Apply default config from image config.
-	if err := addImageEnvs(&g, imageConfig.Env); err != nil {
-		return nil, err
-	}
-
 	if imageConfig.WorkingDir != "" {
-		g.SetProcessCwd(imageConfig.WorkingDir)
+		specOpts = append(specOpts, oci.WithProcessCwd(imageConfig.WorkingDir))
 	}
 
-	if len(imageConfig.Entrypoint) == 0 {
-		// Pause image must have entrypoint.
-		return nil, errors.Errorf("invalid empty entrypoint in image config %+v", imageConfig)
+	if len(imageConfig.Entrypoint) == 0 && len(imageConfig.Cmd) == 0 {
+		// Pause image must have entrypoint or cmd.
+		return nil, errors.Errorf("invalid empty entrypoint and cmd in image config %+v", imageConfig)
 	}
-	// Set process commands.
-	g.SetProcessArgs(append(imageConfig.Entrypoint, imageConfig.Cmd...))
-
-	// Set relative root path.
-	g.SetRootPath(relativeRootfsPath)
-
-	// Make root of sandbox container read-only.
-	g.SetRootReadonly(true)
-
-	// Set hostname.
-	g.SetHostname(config.GetHostname())
+	specOpts = append(specOpts, oci.WithProcessArgs(append(imageConfig.Entrypoint, imageConfig.Cmd...)...))
 
 	// TODO(random-liu): [P2] Consider whether to add labels and annotations to the container.
 
 	// Set cgroups parent.
-	if config.GetLinux().GetCgroupParent() != "" {
-		cgroupsPath := getCgroupsPath(config.GetLinux().GetCgroupParent(), id,
-			c.config.SystemdCgroup)
-		g.SetLinuxCgroupsPath(cgroupsPath)
+	if c.config.DisableCgroup {
+		specOpts = append(specOpts, customopts.WithDisabledCgroups)
+	} else {
+		if config.GetLinux().GetCgroupParent() != "" {
+			cgroupsPath := getCgroupsPath(config.GetLinux().GetCgroupParent(), id,
+				c.config.SystemdCgroup)
+			specOpts = append(specOpts, oci.WithCgroup(cgroupsPath))
+		}
 	}
+
 	// When cgroup parent is not set, containerd-shim will create container in a child cgroup
 	// of the cgroup itself is in.
 	// TODO(random-liu): [P2] Set default cgroup path if cgroup parent is not specified.
 
 	// Set namespace options.
-	securityContext := config.GetLinux().GetSecurityContext()
-	nsOptions := securityContext.GetNamespaceOptions()
+	var (
+		securityContext = config.GetLinux().GetSecurityContext()
+		nsOptions       = securityContext.GetNamespaceOptions()
+	)
 	if nsOptions.GetNetwork() == runtime.NamespaceMode_NODE {
-		g.RemoveLinuxNamespace(string(runtimespec.NetworkNamespace)) // nolint: errcheck
+		specOpts = append(specOpts, customopts.WithoutNamespace(runtimespec.NetworkNamespace))
+		specOpts = append(specOpts, customopts.WithoutNamespace(runtimespec.UTSNamespace))
 	} else {
 		//TODO(Abhi): May be move this to containerd spec opts (WithLinuxSpaceOption)
-		g.AddOrReplaceLinuxNamespace(string(runtimespec.NetworkNamespace), nsPath) // nolint: errcheck
+		specOpts = append(specOpts, oci.WithLinuxNamespace(
+			runtimespec.LinuxNamespace{
+				Type: runtimespec.NetworkNamespace,
+				Path: nsPath,
+			}))
 	}
 	if nsOptions.GetPid() == runtime.NamespaceMode_NODE {
-		g.RemoveLinuxNamespace(string(runtimespec.PIDNamespace)) // nolint: errcheck
+		specOpts = append(specOpts, customopts.WithoutNamespace(runtimespec.PIDNamespace))
 	}
 	if nsOptions.GetIpc() == runtime.NamespaceMode_NODE {
-		g.RemoveLinuxNamespace(string(runtimespec.IPCNamespace)) // nolint: errcheck
+		specOpts = append(specOpts, customopts.WithoutNamespace(runtimespec.IPCNamespace))
 	}
+
+	// It's fine to generate the spec before the sandbox /dev/shm
+	// is actually created.
+	sandboxDevShm := c.getSandboxDevShm(id)
+	if nsOptions.GetIpc() == runtime.NamespaceMode_NODE {
+		sandboxDevShm = devShm
+	}
+	specOpts = append(specOpts, oci.WithMounts([]runtimespec.Mount{
+		{
+			Source:      sandboxDevShm,
+			Destination: devShm,
+			Type:        "bind",
+			Options:     []string{"rbind", "ro"},
+		},
+	}))
 
 	selinuxOpt := securityContext.GetSelinuxOptions()
 	processLabel, mountLabel, err := initSelinuxOpts(selinuxOpt)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to init selinux options %+v", securityContext.GetSelinuxOptions())
 	}
-	g.SetProcessSelinuxLabel(processLabel)
-	g.SetLinuxMountLabel(mountLabel)
 
 	supplementalGroups := securityContext.GetSupplementalGroups()
-	for _, group := range supplementalGroups {
-		g.AddProcessAdditionalGid(uint32(group))
-	}
+	specOpts = append(specOpts,
+		customopts.WithSelinuxLabels(processLabel, mountLabel),
+		customopts.WithSupplementalGroups(supplementalGroups),
+	)
 
 	// Add sysctls
 	sysctls := config.GetLinux().GetSysctls()
-	for key, value := range sysctls {
-		g.AddLinuxSysctl(key, value)
-	}
+	specOpts = append(specOpts, customopts.WithSysctls(sysctls))
 
 	// Note: LinuxSandboxSecurityContext does not currently provide an apparmor profile
 
-	g.SetLinuxResourcesCPUShares(uint64(defaultSandboxCPUshares))
-	g.SetProcessOOMScoreAdj(int(defaultSandboxOOMAdj))
+	if !c.config.DisableCgroup {
+		specOpts = append(specOpts, customopts.WithDefaultSandboxShares)
+	}
+	specOpts = append(specOpts, customopts.WithPodOOMScoreAdj(int(defaultSandboxOOMAdj), c.config.RestrictOOMScoreAdj))
 
-	g.AddAnnotation(annotations.ContainerType, annotations.ContainerTypeSandbox)
-	g.AddAnnotation(annotations.SandboxID, id)
+	for pKey, pValue := range getPassthroughAnnotations(config.Annotations,
+		runtimePodAnnotations) {
+		specOpts = append(specOpts, customopts.WithAnnotation(pKey, pValue))
+	}
 
-	return g.Spec(), nil
+	specOpts = append(specOpts,
+		customopts.WithAnnotation(annotations.ContainerType, annotations.ContainerTypeSandbox),
+		customopts.WithAnnotation(annotations.SandboxID, id),
+		customopts.WithAnnotation(annotations.SandboxLogDir, config.GetLogDirectory()),
+	)
+
+	return runtimeSpec(id, specOpts...)
 }
 
-// setupSandboxFiles sets up necessary sandbox files including /dev/shm, /etc/hosts
-// and /etc/resolv.conf.
+// setupSandboxFiles sets up necessary sandbox files including /dev/shm, /etc/hosts,
+// /etc/resolv.conf and /etc/hostname.
 func (c *criService) setupSandboxFiles(id string, config *runtime.PodSandboxConfig) error {
+	sandboxEtcHostname := c.getSandboxHostname(id)
+	hostname := config.GetHostname()
+	if hostname == "" {
+		var err error
+		hostname, err = c.os.Hostname()
+		if err != nil {
+			return errors.Wrap(err, "failed to get hostname")
+		}
+	}
+	if err := c.os.WriteFile(sandboxEtcHostname, []byte(hostname+"\n"), 0644); err != nil {
+		return errors.Wrapf(err, "failed to write hostname to %q", sandboxEtcHostname)
+	}
+
 	// TODO(random-liu): Consider whether we should maintain /etc/hosts and /etc/resolv.conf in kubelet.
 	sandboxEtcHosts := c.getSandboxHosts(id)
 	if err := c.os.CopyFile(etcHosts, sandboxEtcHosts, 0644); err != nil {
@@ -494,16 +519,14 @@ func parseDNSOptions(servers, searches, options []string) (string, error) {
 }
 
 // unmountSandboxFiles unmount some sandbox files, we rely on the removal of sandbox root directory to
-// remove these files. Unmount should *NOT* return error when:
-//  1) The mount point is already unmounted.
-//  2) The mount point doesn't exist.
+// remove these files. Unmount should *NOT* return error if the mount point is already unmounted.
 func (c *criService) unmountSandboxFiles(id string, config *runtime.PodSandboxConfig) error {
 	if config.GetLinux().GetSecurityContext().GetNamespaceOptions().GetIpc() != runtime.NamespaceMode_NODE {
 		path, err := c.os.FollowSymlinkInScope(c.getSandboxDevShm(id), "/")
 		if err != nil {
 			return errors.Wrap(err, "failed to follow symlink")
 		}
-		if err := c.os.Unmount(path, unix.MNT_DETACH); err != nil && !os.IsNotExist(err) {
+		if err := c.os.Unmount(path); err != nil && !os.IsNotExist(err) {
 			return errors.Wrapf(err, "failed to unmount %q", path)
 		}
 	}
@@ -511,9 +534,9 @@ func (c *criService) unmountSandboxFiles(id string, config *runtime.PodSandboxCo
 }
 
 // setupPod setups up the network for a pod
-func (c *criService) setupPod(id string, path string, config *runtime.PodSandboxConfig) (string, error) {
+func (c *criService) setupPod(id string, path string, config *runtime.PodSandboxConfig) (string, *cni.CNIResult, error) {
 	if c.netPlugin == nil {
-		return "", errors.New("cni config not intialized")
+		return "", nil, errors.New("cni config not initialized")
 	}
 
 	labels := getPodCNILabels(id, config)
@@ -522,17 +545,18 @@ func (c *criService) setupPod(id string, path string, config *runtime.PodSandbox
 		cni.WithLabels(labels),
 		cni.WithCapabilityPortMap(toCNIPortMappings(config.GetPortMappings())))
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
+	logDebugCNIResult(id, result)
 	// Check if the default interface has IP config
 	if configs, ok := result.Interfaces[defaultIfName]; ok && len(configs.IPConfigs) > 0 {
-		return configs.IPConfigs[0].IP.String(), nil
+		return selectPodIP(configs.IPConfigs), result, nil
 	}
 	// If it comes here then the result was invalid so destroy the pod network and return error
 	if err := c.teardownPod(id, path, config); err != nil {
 		logrus.WithError(err).Errorf("Failed to destroy network for sandbox %q", id)
 	}
-	return "", errors.Errorf("failed to find network info for sandbox %q", id)
+	return "", result, errors.Errorf("failed to find network info for sandbox %q", id)
 }
 
 // toCNIPortMappings converts CRI port mappings to CNI.
@@ -540,6 +564,9 @@ func toCNIPortMappings(criPortMappings []*runtime.PortMapping) []cni.PortMapping
 	var portMappings []cni.PortMapping
 	for _, mapping := range criPortMappings {
 		if mapping.HostPort <= 0 {
+			continue
+		}
+		if mapping.Protocol != runtime.Protocol_TCP && mapping.Protocol != runtime.Protocol_UDP {
 			continue
 		}
 		portMappings = append(portMappings, cni.PortMapping{
@@ -552,18 +579,25 @@ func toCNIPortMappings(criPortMappings []*runtime.PortMapping) []cni.PortMapping
 	return portMappings
 }
 
+// selectPodIP select an ip from the ip list. It prefers ipv4 more than ipv6.
+func selectPodIP(ipConfigs []*cni.IPConfig) string {
+	for _, c := range ipConfigs {
+		if c.IP.To4() != nil {
+			return c.IP.String()
+		}
+	}
+	return ipConfigs[0].IP.String()
+}
+
 // untrustedWorkload returns true if the sandbox contains untrusted workload.
 func untrustedWorkload(config *runtime.PodSandboxConfig) bool {
 	return config.GetAnnotations()[annotations.UntrustedWorkload] == "true"
 }
 
-// hostPrivilegedSandbox returns true if the sandbox configuration
-// requires additional host privileges for the sandbox.
-func hostPrivilegedSandbox(config *runtime.PodSandboxConfig) bool {
+// hostAccessingSandbox returns true if the sandbox configuration
+// requires additional host access for the sandbox.
+func hostAccessingSandbox(config *runtime.PodSandboxConfig) bool {
 	securityContext := config.GetLinux().GetSecurityContext()
-	if securityContext.GetPrivileged() {
-		return true
-	}
 
 	namespaceOptions := securityContext.GetNamespaceOptions()
 	if namespaceOptions.GetNetwork() == runtime.NamespaceMode_NODE ||
@@ -578,21 +612,44 @@ func hostPrivilegedSandbox(config *runtime.PodSandboxConfig) bool {
 // getSandboxRuntime returns the runtime configuration for sandbox.
 // If the sandbox contains untrusted workload, runtime for untrusted workload will be returned,
 // or else default runtime will be returned.
-func (c *criService) getSandboxRuntime(config *runtime.PodSandboxConfig) (criconfig.Runtime, error) {
-	untrusted := false
+func (c *criService) getSandboxRuntime(config *runtime.PodSandboxConfig, runtimeHandler string) (criconfig.Runtime, error) {
 	if untrustedWorkload(config) {
-		// TODO(random-liu): Figure out we should return error or not.
-		if hostPrivilegedSandbox(config) {
-			return criconfig.Runtime{}, errors.New("untrusted workload with host privilege is not allowed")
+		// If the untrusted annotation is provided, runtimeHandler MUST be empty.
+		if runtimeHandler != "" && runtimeHandler != criconfig.RuntimeUntrusted {
+			return criconfig.Runtime{}, errors.New("untrusted workload with explicit runtime handler is not allowed")
 		}
-		untrusted = true
+
+		//  If the untrusted workload is requesting access to the host/node, this request will fail.
+		//
+		//  Note: If the workload is marked untrusted but requests privileged, this can be granted, as the
+		// runtime may support this.  For example, in a virtual-machine isolated runtime, privileged
+		// is a supported option, granting the workload to access the entire guest VM instead of host.
+		if hostAccessingSandbox(config) {
+			return criconfig.Runtime{}, errors.New("untrusted workload with host access is not allowed")
+		}
+
+		runtimeHandler = criconfig.RuntimeUntrusted
 	}
 
-	if untrusted {
-		if c.config.ContainerdConfig.UntrustedWorkloadRuntime.Type == "" {
-			return criconfig.Runtime{}, errors.New("no runtime for untrusted workload is configured")
-		}
-		return c.config.ContainerdConfig.UntrustedWorkloadRuntime, nil
+	if runtimeHandler == "" {
+		runtimeHandler = c.config.ContainerdConfig.DefaultRuntimeName
 	}
-	return c.config.ContainerdConfig.DefaultRuntime, nil
+
+	handler, ok := c.config.ContainerdConfig.Runtimes[runtimeHandler]
+	if !ok {
+		return criconfig.Runtime{}, errors.Errorf("no runtime for %q is configured", runtimeHandler)
+	}
+	return handler, nil
+}
+
+func logDebugCNIResult(sandboxID string, result *cni.CNIResult) {
+	if logrus.GetLevel() < logrus.DebugLevel {
+		return
+	}
+	cniResult, err := json.Marshal(result)
+	if err != nil {
+		logrus.WithError(err).Errorf("Failed to marshal CNI result for sandbox %q: %v", sandboxID, err)
+		return
+	}
+	logrus.Debugf("cni result for sandbox %q: %s", sandboxID, string(cniResult))
 }

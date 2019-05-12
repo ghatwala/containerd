@@ -18,10 +18,10 @@ package walking
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"io"
+	"math/rand"
 	"time"
 
 	"github.com/containerd/containerd/archive"
@@ -41,6 +41,7 @@ type walkingDiff struct {
 }
 
 var emptyDesc = ocispec.Descriptor{}
+var uncompressed = "containerd.io/uncompressed"
 
 // NewWalkingDiff is a generic implementation of diff.Comparer.  The diff is
 // calculated by mounting both the upper and lower mount sets and walking the
@@ -86,7 +87,11 @@ func (s *walkingDiff) Compare(ctx context.Context, lower, upper []mount.Mount, o
 				config.Reference = uniqueRef()
 			}
 
-			cw, err := s.store.Writer(ctx, config.Reference, 0, "")
+			cw, err := s.store.Writer(ctx,
+				content.WithRef(config.Reference),
+				content.WithDescriptor(ocispec.Descriptor{
+					MediaType: config.MediaType, // most contentstore implementations just ignore this
+				}))
 			if err != nil {
 				return errors.Wrap(err, "failed to open writer")
 			}
@@ -101,14 +106,15 @@ func (s *walkingDiff) Compare(ctx context.Context, lower, upper []mount.Mount, o
 				}
 			}()
 			if !newReference {
-				if err := cw.Truncate(0); err != nil {
+				if err = cw.Truncate(0); err != nil {
 					return err
 				}
 			}
 
 			if isCompressed {
 				dgstr := digest.SHA256.Digester()
-				compressed, err := compression.CompressStream(cw, compression.Gzip)
+				var compressed io.WriteCloser
+				compressed, err = compression.CompressStream(cw, compression.Gzip)
 				if err != nil {
 					return errors.Wrap(err, "failed to get compressed stream")
 				}
@@ -121,7 +127,7 @@ func (s *walkingDiff) Compare(ctx context.Context, lower, upper []mount.Mount, o
 				if config.Labels == nil {
 					config.Labels = map[string]string{}
 				}
-				config.Labels["containerd.io/uncompressed"] = dgstr.Digest().String()
+				config.Labels[uncompressed] = dgstr.Digest().String()
 			} else {
 				if err = archive.WriteDiff(ctx, cw, lowerRoot, upperRoot); err != nil {
 					return errors.Wrap(err, "failed to write diff")
@@ -135,12 +141,22 @@ func (s *walkingDiff) Compare(ctx context.Context, lower, upper []mount.Mount, o
 
 			dgst := cw.Digest()
 			if err := cw.Commit(ctx, 0, dgst, commitopts...); err != nil {
-				return errors.Wrap(err, "failed to commit")
+				if !errdefs.IsAlreadyExists(err) {
+					return errors.Wrap(err, "failed to commit")
+				}
 			}
 
 			info, err := s.store.Info(ctx, dgst)
 			if err != nil {
 				return errors.Wrap(err, "failed to get info from content store")
+			}
+
+			// Set uncompressed label if digest already existed without label
+			if _, ok := info.Labels[uncompressed]; !ok {
+				info.Labels[uncompressed] = config.Labels[uncompressed]
+				if _, err := s.store.Update(ctx, info, "labels."+uncompressed); err != nil {
+					return errors.Wrap(err, "error setting uncompressed label")
+				}
 			}
 
 			ocidesc = ocispec.Descriptor{

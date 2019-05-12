@@ -21,8 +21,6 @@ import (
 	"io"
 	"runtime"
 	"testing"
-
-	"github.com/containerd/containerd/images/oci"
 )
 
 // TestOCIExport exports testImage as a tar stream
@@ -40,11 +38,11 @@ func TestOCIExport(t *testing.T) {
 	}
 	defer client.Close()
 
-	pulled, err := client.Pull(ctx, testImage)
+	pulled, err := client.Fetch(ctx, testImage)
 	if err != nil {
 		t.Fatal(err)
 	}
-	exportedStream, err := client.Export(ctx, &oci.V1Exporter{}, pulled.Target())
+	exportedStream, err := client.Export(ctx, pulled.Target)
 	if err != nil {
 		t.Fatal(err)
 	}

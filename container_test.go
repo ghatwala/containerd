@@ -22,6 +22,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"syscall"
@@ -31,9 +32,12 @@ import (
 	// Register the typeurl
 	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/containers"
+	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/platforms"
 	_ "github.com/containerd/containerd/runtime"
 	"github.com/containerd/typeurl"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/windows/hcsshimtypes"
@@ -117,7 +121,7 @@ func TestContainerStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withExitStatus(7)), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withExitStatus(7)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +138,7 @@ func TestContainerStart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if pid := task.Pid(); pid <= 0 {
+	if pid := task.Pid(); pid < 1 {
 		t.Errorf("invalid task pid %d", pid)
 	}
 	if err := task.Start(ctx); err != nil {
@@ -181,7 +185,7 @@ func TestContainerOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("echo", expected)), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("echo", expected)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +254,7 @@ func TestContainerExec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +339,7 @@ func TestContainerLargeExecArgs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +415,7 @@ func TestContainerPids(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +437,7 @@ func TestContainerPids(t *testing.T) {
 	}
 
 	pid := task.Pid()
-	if pid <= 0 {
+	if pid < 1 {
 		t.Errorf("invalid task pid %d", pid)
 	}
 	processes, err := task.Pids(ctx)
@@ -488,7 +492,7 @@ func TestContainerCloseIO(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withCat()), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withCat()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,7 +548,7 @@ func TestDeleteRunningContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -599,7 +603,7 @@ func TestContainerKill(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "10")), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "10")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -655,8 +659,8 @@ func TestContainerNoBinaryExists(t *testing.T) {
 	}
 
 	container, err := client.NewContainer(ctx, id,
-		WithNewSpec(oci.WithImageConfig(image), oci.WithProcessArgs("nothing")),
-		WithNewSnapshot(id, image))
+		WithNewSnapshot(id, image),
+		WithNewSpec(oci.WithImageConfig(image), oci.WithProcessArgs("nothing")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,7 +705,7 @@ func TestContainerExecNoBinaryExists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -766,7 +770,7 @@ func TestWaitStoppedTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withExitStatus(7)), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withExitStatus(7)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,7 +787,7 @@ func TestWaitStoppedTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if pid := task.Pid(); pid <= 0 {
+	if pid := task.Pid(); pid < 1 {
 		t.Errorf("invalid task pid %d", pid)
 	}
 	if err := task.Start(ctx); err != nil {
@@ -829,7 +833,7 @@ func TestWaitStoppedProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -916,7 +920,7 @@ func TestTaskForceDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "30")), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "30")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -957,7 +961,7 @@ func TestProcessForceDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "30")), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "30")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1027,11 +1031,10 @@ func TestContainerHostname(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image),
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image),
 		withProcessArgs("hostname"),
 		oci.WithHostname(expected),
-	),
-		WithNewSnapshot(id, image))
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1096,7 +1099,7 @@ func TestContainerExitedAtSet(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withTrue()), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withTrue()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1156,7 +1159,7 @@ func TestDeleteContainerExecCreated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")), WithNewSnapshot(id, image))
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("sleep", "100")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1226,8 +1229,8 @@ func TestContainerMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	container, err := client.NewContainer(ctx, id,
-		WithNewSpec(oci.WithImageConfig(image), oci.WithProcessArgs("sleep", "30")),
-		WithNewSnapshot(id, image))
+		WithNewSnapshot(id, image),
+		WithNewSpec(oci.WithImageConfig(image), oci.WithProcessArgs("sleep", "30")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1237,7 +1240,7 @@ func TestContainerMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer task.Delete(ctx)
+	defer task.Delete(ctx, WithProcessKill)
 
 	statusC, err := task.Wait(ctx)
 	if err != nil {
@@ -1247,6 +1250,7 @@ func TestContainerMetrics(t *testing.T) {
 	metric, err := task.Metrics(ctx)
 	if err != nil {
 		t.Error(err)
+		return
 	}
 	if metric.ID != id {
 		t.Errorf("expected metric id %q but received %q", id, metric.ID)
@@ -1282,9 +1286,8 @@ func TestDeletedContainerMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	container, err := client.NewContainer(ctx, id,
-		WithNewSpec(oci.WithImageConfig(image), withExitStatus(0)),
 		WithNewSnapshot(id, image),
-	)
+		WithNewSpec(oci.WithImageConfig(image), withExitStatus(0)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1468,4 +1471,118 @@ func TestContainerLabels(t *testing.T) {
 	if labels["test"] != "no" {
 		t.Fatalf("expected label \"test\" to be \"no\"")
 	}
+}
+
+func TestContainerHook(t *testing.T) {
+	t.Parallel()
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var (
+		image       Image
+		ctx, cancel = testContext()
+		id          = t.Name()
+	)
+	defer cancel()
+
+	image, err = client.GetImage(ctx, testImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+		if s.Hooks == nil {
+			s.Hooks = &specs.Hooks{}
+		}
+		path, err := exec.LookPath("containerd")
+		if err != nil {
+			return err
+		}
+		psPath, err := exec.LookPath("ps")
+		if err != nil {
+			return err
+		}
+		s.Hooks.Prestart = []specs.Hook{
+			{
+				Path: path,
+				Args: []string{
+					"containerd",
+					"oci-hook", "--",
+					psPath, "--pid", "{{pid}}",
+				},
+				Env: os.Environ(),
+			},
+		}
+		return nil
+	}
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), hook))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	task, err := container.NewTask(ctx, empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer task.Delete(ctx, WithProcessKill)
+}
+
+func TestShimSockLength(t *testing.T) {
+	t.Parallel()
+
+	// Max length of namespace should be 76
+	namespace := strings.Repeat("n", 76)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctx = namespaces.WithNamespace(ctx, namespace)
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	image, err := client.Pull(ctx, testImage,
+		WithPlatformMatcher(platforms.Default()),
+		WithPullUnpack,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := strings.Repeat("c", 64)
+
+	// We don't have limitation with length of container name,
+	// but 64 bytes of sha256 is the common case
+	container, err := client.NewContainer(ctx, id,
+		WithNewSnapshot(id, image),
+		WithNewSpec(oci.WithImageConfig(image), withExitStatus(0)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer container.Delete(ctx, WithSnapshotCleanup)
+
+	task, err := container.NewTask(ctx, empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer task.Delete(ctx)
+
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := task.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	<-statusC
 }

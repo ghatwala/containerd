@@ -49,7 +49,7 @@ Documentation=https://containerd.io
 After=network.target
 
 [Service]
-ExecStartPre=/sbin/modprobe overlay
+ExecStartPre=-/sbin/modprobe overlay
 ExecStart=/usr/local/bin/containerd
 Delegate=yes
 KillMode=process
@@ -69,6 +69,10 @@ This is not what we want.
 As ops, we want to be able to upgrade containerd and allow existing containers to keep running without interruption.
 Setting `KillMode` to `process` ensures that systemd only kills the containerd daemon and not any child processes such as the shims and containers.
 
+The following `systemd-run` command starts containerd in a similar way:
+```
+sudo systemd-run -p Delegate=yes -p KillMode=process /usr/local/bin/containerd
+```
 
 ## Base Configuration
 
@@ -215,4 +219,22 @@ The linux runtime allows a few options to be set to configure the shim and the r
 	# do not put the shim in its own mount namespace
 	# (this only need to be set on kernel < 3.18)
 	shim_no_newns = true
+```
+
+### Bolt Metadata Plugin
+
+The bolt metadata plugin allows configuration of the content sharing policy between namespaces.
+
+The default mode "shared" will make blobs available in all namespaces once it is pulled into any namespace.
+The blob will be pulled into the namespace if a writer is opened with the "Expected" digest that is already present in the backend.
+
+The alternative mode, "isolated" requires that clients prove they have access to the content by providing all of the content to the ingest before the blob is added to the namespace.
+
+Both modes share backing data, while "shared" will reduce total bandwidth across namespaces, at the cost of allowing access to any blob just by knowing its digest.
+
+The default is "shared". While this is largely the most desired policy, one can change to "isolated" mode with the following configuration:
+
+```toml
+[plugins.bolt]
+	content_sharing_policy = "isolated"
 ```

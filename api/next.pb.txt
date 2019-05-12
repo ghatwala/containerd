@@ -181,8 +181,8 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       options {
-        65003: "github.com/opencontainers/go-digest.Digest"
         65001: 0
+        65003: "github.com/opencontainers/go-digest.Digest"
       }
       json_name: "digest"
     }
@@ -622,10 +622,17 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "exitedAt"
+    }
+    field {
+      name: "id"
+      number: 5
+      label: LABEL_OPTIONAL
+      type: TYPE_STRING
+      json_name: "id"
     }
   }
   message_type {
@@ -696,8 +703,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "exitedAt"
     }
@@ -907,8 +914,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "createdAt"
     }
@@ -919,8 +926,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "updatedAt"
     }
@@ -1117,6 +1124,17 @@ file {
       json_name: "id"
     }
   }
+  message_type {
+    name: "ListContainerMessage"
+    field {
+      name: "container"
+      number: 1
+      label: LABEL_OPTIONAL
+      type: TYPE_MESSAGE
+      type_name: ".containerd.services.containers.v1.Container"
+      json_name: "container"
+    }
+  }
   service {
     name: "Containers"
     method {
@@ -1128,6 +1146,12 @@ file {
       name: "List"
       input_type: ".containerd.services.containers.v1.ListContainersRequest"
       output_type: ".containerd.services.containers.v1.ListContainersResponse"
+    }
+    method {
+      name: "ListStream"
+      input_type: ".containerd.services.containers.v1.ListContainersRequest"
+      output_type: ".containerd.services.containers.v1.ListContainerMessage"
+      server_streaming: true
     }
     method {
       name: "Create"
@@ -1166,8 +1190,8 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       options {
-        65003: "github.com/opencontainers/go-digest.Digest"
         65001: 0
+        65003: "github.com/opencontainers/go-digest.Digest"
       }
       json_name: "digest"
     }
@@ -1185,8 +1209,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "createdAt"
     }
@@ -1197,8 +1221,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "updatedAt"
     }
@@ -1239,8 +1263,8 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       options {
-        65003: "github.com/opencontainers/go-digest.Digest"
         65001: 0
+        65003: "github.com/opencontainers/go-digest.Digest"
       }
       json_name: "digest"
     }
@@ -1327,8 +1351,8 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       options {
-        65003: "github.com/opencontainers/go-digest.Digest"
         65001: 0
+        65003: "github.com/opencontainers/go-digest.Digest"
       }
       json_name: "digest"
     }
@@ -1341,8 +1365,8 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       options {
-        65003: "github.com/opencontainers/go-digest.Digest"
         65001: 0
+        65003: "github.com/opencontainers/go-digest.Digest"
       }
       json_name: "digest"
     }
@@ -1387,8 +1411,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "startedAt"
     }
@@ -1399,8 +1423,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "updatedAt"
     }
@@ -1431,8 +1455,8 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       options {
-        65003: "github.com/opencontainers/go-digest.Digest"
         65001: 0
+        65003: "github.com/opencontainers/go-digest.Digest"
       }
       json_name: "expected"
     }
@@ -1512,8 +1536,8 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       options {
-        65003: "github.com/opencontainers/go-digest.Digest"
         65001: 0
+        65003: "github.com/opencontainers/go-digest.Digest"
       }
       json_name: "expected"
     }
@@ -1577,8 +1601,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "startedAt"
     }
@@ -1589,8 +1613,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "updatedAt"
     }
@@ -1614,8 +1638,8 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       options {
-        65003: "github.com/opencontainers/go-digest.Digest"
         65001: 0
+        65003: "github.com/opencontainers/go-digest.Digest"
       }
       json_name: "digest"
     }
@@ -1735,8 +1759,8 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       options {
-        65003: "github.com/opencontainers/go-digest.Digest"
         65001: 0
+        65003: "github.com/opencontainers/go-digest.Digest"
       }
       json_name: "digest"
     }
@@ -1746,6 +1770,34 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_INT64
       json_name: "size"
+    }
+    field {
+      name: "annotations"
+      number: 5
+      label: LABEL_REPEATED
+      type: TYPE_MESSAGE
+      type_name: ".containerd.types.Descriptor.AnnotationsEntry"
+      json_name: "annotations"
+    }
+    nested_type {
+      name: "AnnotationsEntry"
+      field {
+        name: "key"
+        number: 1
+        label: LABEL_OPTIONAL
+        type: TYPE_STRING
+        json_name: "key"
+      }
+      field {
+        name: "value"
+        number: 2
+        label: LABEL_OPTIONAL
+        type: TYPE_STRING
+        json_name: "value"
+      }
+      options {
+        map_entry: true
+      }
     }
   }
   options {
@@ -1937,8 +1989,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "timestamp"
     }
@@ -2037,8 +2089,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "createdAt"
     }
@@ -2049,8 +2101,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "updatedAt"
     }
@@ -2454,8 +2506,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "createdAt"
     }
@@ -2545,6 +2597,13 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       json_name: "id"
+    }
+    field {
+      name: "sync"
+      number: 2
+      label: LABEL_OPTIONAL
+      type: TYPE_BOOL
+      json_name: "sync"
     }
   }
   message_type {
@@ -3071,8 +3130,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "createdAt"
     }
@@ -3083,8 +3142,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "updatedAt"
     }
@@ -3337,8 +3396,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "timestamp"
     }
@@ -3443,8 +3502,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "exitedAt"
     }
@@ -3676,8 +3735,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "exitedAt"
     }
@@ -3946,8 +4005,8 @@ file {
       label: LABEL_OPTIONAL
       type: TYPE_STRING
       options {
-        65003: "github.com/opencontainers/go-digest.Digest"
         65001: 0
+        65003: "github.com/opencontainers/go-digest.Digest"
       }
       json_name: "parentCheckpoint"
     }
@@ -4043,8 +4102,8 @@ file {
       type: TYPE_MESSAGE
       type_name: ".google.protobuf.Timestamp"
       options {
-        65010: 1
         65001: 0
+        65010: 1
       }
       json_name: "exitedAt"
     }
@@ -4141,6 +4200,80 @@ file {
     go_package: "github.com/containerd/containerd/api/services/tasks/v1;tasks"
   }
   weak_dependency: 2
+  syntax: "proto3"
+}
+file {
+  name: "github.com/containerd/containerd/api/services/ttrpc/events/v1/events.proto"
+  package: "containerd.services.events.ttrpc.v1"
+  dependency: "github.com/containerd/containerd/protobuf/plugin/fieldpath.proto"
+  dependency: "gogoproto/gogo.proto"
+  dependency: "google/protobuf/any.proto"
+  dependency: "google/protobuf/empty.proto"
+  dependency: "google/protobuf/timestamp.proto"
+  message_type {
+    name: "ForwardRequest"
+    field {
+      name: "envelope"
+      number: 1
+      label: LABEL_OPTIONAL
+      type: TYPE_MESSAGE
+      type_name: ".containerd.services.events.ttrpc.v1.Envelope"
+      json_name: "envelope"
+    }
+  }
+  message_type {
+    name: "Envelope"
+    field {
+      name: "timestamp"
+      number: 1
+      label: LABEL_OPTIONAL
+      type: TYPE_MESSAGE
+      type_name: ".google.protobuf.Timestamp"
+      options {
+        65001: 0
+        65010: 1
+      }
+      json_name: "timestamp"
+    }
+    field {
+      name: "namespace"
+      number: 2
+      label: LABEL_OPTIONAL
+      type: TYPE_STRING
+      json_name: "namespace"
+    }
+    field {
+      name: "topic"
+      number: 3
+      label: LABEL_OPTIONAL
+      type: TYPE_STRING
+      json_name: "topic"
+    }
+    field {
+      name: "event"
+      number: 4
+      label: LABEL_OPTIONAL
+      type: TYPE_MESSAGE
+      type_name: ".google.protobuf.Any"
+      json_name: "event"
+    }
+    options {
+      64400: 1
+    }
+  }
+  service {
+    name: "Events"
+    method {
+      name: "Forward"
+      input_type: ".containerd.services.events.ttrpc.v1.ForwardRequest"
+      output_type: ".google.protobuf.Empty"
+    }
+  }
+  options {
+    go_package: "github.com/containerd/containerd/api/services/ttrpc/events/v1;events"
+  }
+  weak_dependency: 0
+  weak_dependency: 1
   syntax: "proto3"
 }
 file {

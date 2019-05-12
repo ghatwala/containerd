@@ -18,9 +18,11 @@ package cni
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	cnilibrary "github.com/containernetworking/cni/libcni"
+	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/pkg/errors"
 )
@@ -31,9 +33,37 @@ type CNI interface {
 	// Remove tears down the network of the namespace.
 	Remove(id string, path string, opts ...NamespaceOpts) error
 	// Load loads the cni network config
-	Load(opts ...LoadOption) error
+	Load(opts ...CNIOpt) error
 	// Status checks the status of the cni initialization
 	Status() error
+	// GetConfig returns a copy of the CNI plugin configurations as parsed by CNI
+	GetConfig() *ConfigResult
+}
+
+type ConfigResult struct {
+	PluginDirs    []string
+	PluginConfDir string
+	Prefix        string
+	Networks      []*ConfNetwork
+}
+
+type ConfNetwork struct {
+	Config *NetworkConfList
+	IFName string
+}
+
+// NetworkConfList is a source bytes to string version of cnilibrary.NetworkConfigList
+type NetworkConfList struct {
+	Name       string
+	CNIVersion string
+	Plugins    []*NetworkConf
+	Source     string
+}
+
+// NetworkConf is a source bytes to string conversion of cnilibrary.NetworkConfig
+type NetworkConf struct {
+	Network *types.NetConf
+	Source  string
 }
 
 type libcni struct {
@@ -59,7 +89,8 @@ func defaultCNIConfig() *libcni {
 	}
 }
 
-func New(config ...ConfigOption) (CNI, error) {
+// New creates a new libcni instance.
+func New(config ...CNIOpt) (CNI, error) {
 	cni := defaultCNIConfig()
 	var err error
 	for _, c := range config {
@@ -70,8 +101,11 @@ func New(config ...ConfigOption) (CNI, error) {
 	return cni, nil
 }
 
-func (c *libcni) Load(opts ...LoadOption) error {
+// Load loads the latest config from cni config files.
+func (c *libcni) Load(opts ...CNIOpt) error {
 	var err error
+	c.Lock()
+	defer c.Unlock()
 	// Reset the networks on a load operation to ensure
 	// config happens on a clean slate
 	c.reset()
@@ -81,9 +115,10 @@ func (c *libcni) Load(opts ...LoadOption) error {
 			return errors.Wrapf(ErrLoad, fmt.Sprintf("cni config load failed: %v", err))
 		}
 	}
-	return c.Status()
+	return nil
 }
 
+// Status returns the status of CNI initialization.
 func (c *libcni) Status() error {
 	c.RLock()
 	defer c.RUnlock()
@@ -93,19 +128,25 @@ func (c *libcni) Status() error {
 	return nil
 }
 
+// Networks returns all the configured networks.
+// NOTE: Caller MUST NOT modify anything in the returned array.
+func (c *libcni) Networks() []*Network {
+	c.RLock()
+	defer c.RUnlock()
+	return append([]*Network{}, c.networks...)
+}
+
 // Setup setups the network in the namespace
 func (c *libcni) Setup(id string, path string, opts ...NamespaceOpts) (*CNIResult, error) {
-	if err:=c.Status();err!=nil{
-		return nil,err
+	if err := c.Status(); err != nil {
+		return nil, err
 	}
 	ns, err := newNamespace(id, path, opts...)
 	if err != nil {
 		return nil, err
 	}
 	var results []*current.Result
-	c.RLock()
-	defer c.RUnlock()
-	for _, network := range c.networks {
+	for _, network := range c.Networks() {
 		r, err := network.Attach(ns)
 		if err != nil {
 			return nil, err
@@ -117,25 +158,59 @@ func (c *libcni) Setup(id string, path string, opts ...NamespaceOpts) (*CNIResul
 
 // Remove removes the network config from the namespace
 func (c *libcni) Remove(id string, path string, opts ...NamespaceOpts) error {
-	if err:=c.Status();err!=nil{
-           return err
-        }
+	if err := c.Status(); err != nil {
+		return err
+	}
 	ns, err := newNamespace(id, path, opts...)
 	if err != nil {
 		return err
 	}
-	c.RLock()
-	defer c.RUnlock()
-	for _, network := range c.networks {
+	for _, network := range c.Networks() {
 		if err := network.Remove(ns); err != nil {
+			// Based on CNI spec v0.7.0, empty network namespace is allowed to
+			// do best effort cleanup. However, it is not handled consistently
+			// right now:
+			// https://github.com/containernetworking/plugins/issues/210
+			// TODO(random-liu): Remove the error handling when the issue is
+			// fixed and the CNI spec v0.6.0 support is deprecated.
+			if path == "" && strings.Contains(err.Error(), "no such file or directory") {
+				continue
+			}
 			return err
 		}
 	}
 	return nil
 }
 
+// GetConfig returns a copy of the CNI plugin configurations as parsed by CNI
+func (c *libcni) GetConfig() *ConfigResult {
+	c.RLock()
+	defer c.RUnlock()
+	r := &ConfigResult{
+		PluginDirs:    c.config.pluginDirs,
+		PluginConfDir: c.config.pluginConfDir,
+		Prefix:        c.config.prefix,
+	}
+	for _, network := range c.networks {
+		conf := &NetworkConfList{
+			Name:       network.config.Name,
+			CNIVersion: network.config.CNIVersion,
+			Source:     string(network.config.Bytes),
+		}
+		for _, plugin := range network.config.Plugins {
+			conf.Plugins = append(conf.Plugins, &NetworkConf{
+				Network: plugin.Network,
+				Source:  string(plugin.Bytes),
+			})
+		}
+		r.Networks = append(r.Networks, &ConfNetwork{
+			Config: conf,
+			IFName: network.ifName,
+		})
+	}
+	return r
+}
+
 func (c *libcni) reset() {
-	c.Lock()
-	defer c.Unlock()
 	c.networks = nil
 }

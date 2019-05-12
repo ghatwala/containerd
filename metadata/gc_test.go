@@ -25,11 +25,12 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/gc"
 	"github.com/containerd/containerd/metadata/boltutil"
 	digest "github.com/opencontainers/go-digest"
+	bolt "go.etcd.io/bbolt"
 )
 
 func TestGCRoots(t *testing.T) {
@@ -42,14 +43,30 @@ func TestGCRoots(t *testing.T) {
 	alters := []alterFunc{
 		addImage("ns1", "image1", dgst(1), nil),
 		addImage("ns1", "image2", dgst(2), labelmap(string(labelGCSnapRef)+"overlay", "sn2")),
+		addImage("ns2", "image3", dgst(10), labelmap(string(labelGCContentRef), dgst(11).String())),
 		addContainer("ns1", "container1", "overlay", "sn4", nil),
 		addContainer("ns1", "container2", "overlay", "sn5", labelmap(string(labelGCSnapRef)+"overlay", "sn6")),
-		addContainer("ns1", "container3", "overlay", "sn7", labelmap(string(labelGCSnapRef)+"overlay/anything-1", "sn8", string(labelGCSnapRef)+"overlay/anything-2", "sn9")),
+		addContainer("ns1", "container3", "overlay", "sn7", labelmap(
+			string(labelGCSnapRef)+"overlay/anything-1", "sn8",
+			string(labelGCSnapRef)+"overlay/anything-2", "sn9",
+			string(labelGCContentRef), dgst(7).String())),
+		addContainer("ns1", "container4", "", "", labelmap(
+			string(labelGCContentRef)+".0", dgst(8).String(),
+			string(labelGCContentRef)+".1", dgst(9).String())),
 		addContent("ns1", dgst(1), nil),
 		addContent("ns1", dgst(2), nil),
 		addContent("ns1", dgst(3), nil),
 		addContent("ns2", dgst(1), nil),
 		addContent("ns2", dgst(2), labelmap(string(labelGCRoot), "always")),
+		addContent("ns2", dgst(8), nil),
+		addContent("ns2", dgst(9), nil),
+		addIngest("ns1", "ingest-1", "", nil),       // will be seen as expired
+		addIngest("ns1", "ingest-2", "", timeIn(0)), // expired
+		addIngest("ns1", "ingest-3", "", timeIn(time.Hour)),
+		addIngest("ns2", "ingest-4", "", nil),
+		addIngest("ns2", "ingest-5", dgst(8), nil),
+		addIngest("ns2", "ingest-6", "", nil),      // added to expired lease
+		addIngest("ns2", "ingest-7", dgst(9), nil), // added to expired lease
 		addSnapshot("ns1", "overlay", "sn1", "", nil),
 		addSnapshot("ns1", "overlay", "sn2", "", nil),
 		addSnapshot("ns1", "overlay", "sn3", "", labelmap(string(labelGCRoot), "always")),
@@ -63,14 +80,30 @@ func TestGCRoots(t *testing.T) {
 		addLeaseSnapshot("ns2", "l2", "overlay", "sn6"),
 		addLeaseContent("ns2", "l1", dgst(4)),
 		addLeaseContent("ns2", "l2", dgst(5)),
+		addLease("ns2", "l3", labelmap(string(labelGCExpire), time.Now().Add(time.Hour).Format(time.RFC3339))),
+		addLeaseContent("ns2", "l3", dgst(6)),
+		addLeaseSnapshot("ns2", "l3", "overlay", "sn7"),
+		addLeaseIngest("ns2", "l3", "ingest-4"),
+		addLeaseIngest("ns2", "l3", "ingest-5"),
+		addLease("ns2", "l4", labelmap(string(labelGCExpire), time.Now().Format(time.RFC3339))),
+		addLeaseContent("ns2", "l4", dgst(7)),
+		addLeaseSnapshot("ns2", "l4", "overlay", "sn8"),
+		addLeaseIngest("ns2", "l4", "ingest-6"),
+		addLeaseIngest("ns2", "l4", "ingest-7"),
 	}
 
 	expected := []gc.Node{
 		gcnode(ResourceContent, "ns1", dgst(1).String()),
 		gcnode(ResourceContent, "ns1", dgst(2).String()),
+		gcnode(ResourceContent, "ns1", dgst(7).String()),
+		gcnode(ResourceContent, "ns1", dgst(8).String()),
+		gcnode(ResourceContent, "ns1", dgst(9).String()),
 		gcnode(ResourceContent, "ns2", dgst(2).String()),
 		gcnode(ResourceContent, "ns2", dgst(4).String()),
 		gcnode(ResourceContent, "ns2", dgst(5).String()),
+		gcnode(ResourceContent, "ns2", dgst(6).String()),
+		gcnode(ResourceContent, "ns2", dgst(10).String()),
+		gcnode(ResourceContent, "ns2", dgst(11).String()),
 		gcnode(ResourceSnapshot, "ns1", "overlay/sn2"),
 		gcnode(ResourceSnapshot, "ns1", "overlay/sn3"),
 		gcnode(ResourceSnapshot, "ns1", "overlay/sn4"),
@@ -81,6 +114,13 @@ func TestGCRoots(t *testing.T) {
 		gcnode(ResourceSnapshot, "ns1", "overlay/sn9"),
 		gcnode(ResourceSnapshot, "ns2", "overlay/sn5"),
 		gcnode(ResourceSnapshot, "ns2", "overlay/sn6"),
+		gcnode(ResourceSnapshot, "ns2", "overlay/sn7"),
+		gcnode(ResourceLease, "ns2", "l1"),
+		gcnode(ResourceLease, "ns2", "l2"),
+		gcnode(ResourceLease, "ns2", "l3"),
+		gcnode(ResourceIngest, "ns1", "ingest-3"),
+		gcnode(ResourceIngest, "ns2", "ingest-4"),
+		gcnode(ResourceIngest, "ns2", "ingest-5"),
 	}
 
 	if err := db.Update(func(tx *bolt.Tx) error {
@@ -121,11 +161,15 @@ func TestGCRemove(t *testing.T) {
 		addContent("ns1", dgst(3), nil),
 		addContent("ns2", dgst(1), nil),
 		addContent("ns2", dgst(2), labelmap(string(labelGCRoot), "always")),
+		addIngest("ns1", "ingest-1", "", nil),
+		addIngest("ns2", "ingest-2", "", timeIn(0)),
 		addSnapshot("ns1", "overlay", "sn1", "", nil),
 		addSnapshot("ns1", "overlay", "sn2", "", nil),
 		addSnapshot("ns1", "overlay", "sn3", "", labelmap(string(labelGCRoot), "always")),
 		addSnapshot("ns1", "overlay", "sn4", "", nil),
 		addSnapshot("ns2", "overlay", "sn1", "", nil),
+		addLease("ns1", "l1", labelmap(string(labelGCExpire), time.Now().Add(time.Hour).Format(time.RFC3339))),
+		addLease("ns2", "l2", labelmap(string(labelGCExpire), time.Now().Format(time.RFC3339))),
 	}
 
 	all := []gc.Node{
@@ -139,6 +183,10 @@ func TestGCRemove(t *testing.T) {
 		gcnode(ResourceSnapshot, "ns1", "overlay/sn3"),
 		gcnode(ResourceSnapshot, "ns1", "overlay/sn4"),
 		gcnode(ResourceSnapshot, "ns2", "overlay/sn1"),
+		gcnode(ResourceLease, "ns1", "l1"),
+		gcnode(ResourceLease, "ns2", "l2"),
+		gcnode(ResourceIngest, "ns1", "ingest-1"),
+		gcnode(ResourceIngest, "ns2", "ingest-2"),
 	}
 
 	var deleted, remaining []gc.Node
@@ -207,6 +255,8 @@ func TestGCRefs(t *testing.T) {
 		addContent("ns1", dgst(7), labelmap(string(labelGCContentRef)+"/anything-1", dgst(2).String(), string(labelGCContentRef)+"/anything-2", dgst(3).String())),
 		addContent("ns2", dgst(1), nil),
 		addContent("ns2", dgst(2), nil),
+		addIngest("ns1", "ingest-1", "", nil),
+		addIngest("ns2", "ingest-2", dgst(8), nil),
 		addSnapshot("ns1", "overlay", "sn1", "", nil),
 		addSnapshot("ns1", "overlay", "sn2", "sn1", nil),
 		addSnapshot("ns1", "overlay", "sn3", "sn2", nil),
@@ -215,6 +265,9 @@ func TestGCRefs(t *testing.T) {
 		addSnapshot("ns1", "btrfs", "sn1", "", nil),
 		addSnapshot("ns2", "overlay", "sn1", "", nil),
 		addSnapshot("ns2", "overlay", "sn2", "sn1", nil),
+		addSnapshot("ns2", "overlay", "sn3", "", labelmap(
+			string(labelGCContentRef), dgst(1).String(),
+			string(labelGCContentRef)+".keep-me", dgst(6).String())),
 	}
 
 	refs := map[gc.Node][]gc.Node{
@@ -254,6 +307,14 @@ func TestGCRefs(t *testing.T) {
 		gcnode(ResourceSnapshot, "ns2", "overlay/sn1"): nil,
 		gcnode(ResourceSnapshot, "ns2", "overlay/sn2"): {
 			gcnode(ResourceSnapshot, "ns2", "overlay/sn1"),
+		},
+		gcnode(ResourceSnapshot, "ns2", "overlay/sn3"): {
+			gcnode(ResourceContent, "ns2", dgst(1).String()),
+			gcnode(ResourceContent, "ns2", dgst(6).String()),
+		},
+		gcnode(ResourceIngest, "ns1", "ingest-1"): nil,
+		gcnode(ResourceIngest, "ns2", "ingest-2"): {
+			gcnode(ResourceContent, "ns2", dgst(8).String()),
 		},
 	}
 
@@ -425,6 +486,36 @@ func addContent(ns string, dgst digest.Digest, labels map[string]string) alterFu
 	}
 }
 
+func addIngest(ns, ref string, expected digest.Digest, expires *time.Time) alterFunc {
+	return func(bkt *bolt.Bucket) error {
+		cbkt, err := createBuckets(bkt, ns, string(bucketKeyObjectContent), string(bucketKeyObjectIngests), ref)
+		if err != nil {
+			return err
+		}
+		if expected != "" {
+			if err := cbkt.Put(bucketKeyExpected, []byte(expected)); err != nil {
+				return err
+			}
+		}
+		if expires != nil {
+			if err := writeExpireAt(*expires, cbkt); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+func addLease(ns, lid string, labels map[string]string) alterFunc {
+	return func(bkt *bolt.Bucket) error {
+		lbkt, err := createBuckets(bkt, ns, string(bucketKeyObjectLeases), lid)
+		if err != nil {
+			return err
+		}
+		return boltutil.WriteLabels(lbkt, labels)
+	}
+}
+
 func addLeaseSnapshot(ns, lid, snapshotter, name string) alterFunc {
 	return func(bkt *bolt.Bucket) error {
 		sbkt, err := createBuckets(bkt, ns, string(bucketKeyObjectLeases), lid, string(bucketKeyObjectSnapshots), snapshotter)
@@ -442,6 +533,16 @@ func addLeaseContent(ns, lid string, dgst digest.Digest) alterFunc {
 			return err
 		}
 		return cbkt.Put([]byte(dgst.String()), nil)
+	}
+}
+
+func addLeaseIngest(ns, lid, ref string) alterFunc {
+	return func(bkt *bolt.Bucket) error {
+		cbkt, err := createBuckets(bkt, ns, string(bucketKeyObjectLeases), lid, string(bucketKeyObjectIngests))
+		if err != nil {
+			return err
+		}
+		return cbkt.Put([]byte(ref), nil)
 	}
 }
 
@@ -490,4 +591,9 @@ func dgst(i int64) digest.Digest {
 		panic(err)
 	}
 	return dgstr.Digest()
+}
+
+func timeIn(d time.Duration) *time.Time {
+	t := time.Now().UTC().Add(d)
+	return &t
 }

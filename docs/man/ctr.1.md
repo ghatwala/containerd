@@ -1,5 +1,9 @@
 # ctr 1 01/30/2018
 
+## NAME
+
+ctr - command line for containerd
+
 ## SYNOPSIS
 
 **ctr [global options] command [command options] [arguments...]**
@@ -91,4 +95,4 @@ Phil Estes <estesp@gmail.com>
 
 ## SEE ALSO
 
-containerd(1), config.toml(5), containerd-config(1)
+containerd(1), containerd-config(1), containerd-config.toml(5)
