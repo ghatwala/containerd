@@ -6,6 +6,10 @@ services:
 
 language: go
 
+os:
+- linux
+- linux-ppc64le
+
 go:
   - "1.12.x"
 os:
@@ -40,6 +44,11 @@ env:
   - TRAVIS_GOOS=linux TEST_RUNTIME=io.containerd.runc.v1 TRAVIS_CGO_ENABLED=1
   - TRAVIS_GOOS=linux TEST_RUNTIME=io.containerd.runc.v2 TRAVIS_CGO_ENABLED=1
   - TRAVIS_GOOS=linux TEST_RUNTIME=io.containerd.runtime.v1.linux TRAVIS_CGO_ENABLED=1
+
+matrix:
+    exclude:
+       - env: TRAVIS_GOOS=darwin TRAVIS_CGO_ENABLED=0
+         os: linux-ppc64le
 
 before_install:
   - uname -r
