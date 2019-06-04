@@ -20,7 +20,7 @@
 #
 set -eu -o pipefail
 
-PROTOBUF_VERSION=3.5.1
+PROTOBUF_VERSION=3.8.0
 GOARCH=$(go env GOARCH)
 GOOS=$(go env GOOS)
 PROTOBUF_DIR=$(mktemp -d)
