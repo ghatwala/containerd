@@ -246,7 +246,16 @@ version = 1
 			continue
 		}
 		path := filepath.Join(v, customCgroup)
+		fmt.Printf("PATH v IS %v", v)
+		fmt.Printf("PATH customCgroup IS %v", customCgroup)
+		fmt.Printf("FULL PATH IS %v", path)
 		if _, err := os.Stat(path); err != nil {
+	                if _, err := os.Stat(v); err != nil {
+        	                if os.IsNotExist(err) {
+                	                t.Fatalf("custom cgroup v path %s should exist, actually not", v)
+                        	}
+			}
+
 			if os.IsNotExist(err) {
 				t.Fatalf("custom cgroup path %s should exist, actually not", path)
 			}
