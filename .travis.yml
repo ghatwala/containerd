@@ -36,6 +36,7 @@ addons:
       - libprotobuf-dev
       - socat
       - libseccomp-dev
+      - unzip
 
 env:
   - TRAVIS_GOOS=linux TEST_RUNTIME=io.containerd.runc.v1 TRAVIS_CGO_ENABLED=1
@@ -45,7 +46,7 @@ env:
 matrix:
     exclude:
        - env: TRAVIS_GOOS=darwin TRAVIS_CGO_ENABLED=0
-         os: linux-ppc64le
+         os: linux
 
 before_install:
   - uname -r
